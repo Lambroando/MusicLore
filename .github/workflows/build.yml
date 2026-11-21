@@ -1,0 +1,44 @@
+name: Build iOS IPA
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Scarica il codice
+        uses: actions/checkout@v4
+
+      - name: Installa XcodeGen
+        run: brew install xcodegen
+
+      - name: Genera progetto Xcode
+        run: xcodegen generate
+
+      - name: Compila app non firmata
+        run: |
+          xcodebuild \
+            -project MusicLore.xcodeproj \
+            -scheme MusicLore \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            SYMROOT=build \
+            build
+
+      - name: Impacchetta file .ipa
+        run: |
+          mkdir -p Payload
+          cp -r build/Release-iphoneos/MusicLore.app Payload/
+          zip -r MusicLore.ipa Payload
+
+      - name: Carica .ipa come Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicLore-IPA
+          path: MusicLore.ipa

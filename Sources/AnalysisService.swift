@@ -47,6 +47,14 @@ final class AnalysisService: ObservableObject {
     private let apiKeyStorageKey = "musiclore_gemini_api_key"
     private let cachePrefix = "musiclore_cache_"
 
+    // Modelli verificati come attivi sulla chiave, in ordine di priorità
+    private let candidateModels = [
+        "gemini-3.5-flash-lite",
+        "gemini-flash-lite-latest",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview"
+    ]
+
     var hasAPIKey: Bool {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -80,11 +88,17 @@ final class AnalysisService: ObservableObject {
 
         do {
             let lyrics = await fetchLyrics(artist: track.artist, title: track.title, album: track.album)
-            let result = try await requestGeminiAnalysis(track: track, lyrics: lyrics, apiKey: cleanedKey)
+            let result = try await requestGeminiWithFallback(track: track, lyrics: lyrics, apiKey: cleanedKey)
             saveToCache(result, forKey: key)
             self.analysis = result
             self.isLoading = false
+        } catch is CancellationError {
+            self.isLoading = false
         } catch {
+            if let urlError = error as? URLError, urlError.code == .cancelled {
+                self.isLoading = false
+                return
+            }
             self.errorMessage = error.localizedDescription
             self.isLoading = false
         }
@@ -118,7 +132,8 @@ final class AnalysisService: ObservableObject {
         guard let url = components?.url else { return nil }
 
         var request = URLRequest(url: url)
-        request.timeoutInterval = 8
+        request.timeoutInterval = 6
+        request.assumesHTTP3Capable = false
         request.setValue("MusicLore/1.0 (iOS)", forHTTPHeaderField: "User-Agent")
 
         do {
@@ -141,6 +156,11 @@ final class AnalysisService: ObservableObject {
 
     // MARK: - Gemini API
 
+    private enum AttemptError: Error {
+        case retryable(Error)
+        case fatal(Error)
+    }
+
     private struct GeminiRequest: Encodable {
         struct Content: Encodable {
             struct Part: Encodable {
@@ -149,16 +169,9 @@ final class AnalysisService: ObservableObject {
             let parts: [Part]
         }
         struct GenerationConfig: Encodable {
-            struct Schema: Encodable {
-                struct Property: Encodable {
-                    let type: String
-                }
-                let type: String
-                let properties: [String: Property]
-                let required: [String]
-            }
             let responseMimeType: String
-            let responseSchema: Schema
+            let maxOutputTokens: Int
+            let temperature: Double
         }
         let contents: [Content]
         let generationConfig: GenerationConfig
@@ -187,91 +200,123 @@ final class AnalysisService: ObservableObject {
         let lyricsExplanation: String
     }
 
-    private func requestGeminiAnalysis(track: CurrentTrack, lyrics: String?, apiKey: String) async throws -> TrackAnalysis {
-        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key=\(apiKey)"
+    private func requestGeminiWithFallback(track: CurrentTrack, lyrics: String?, apiKey: String) async throws -> TrackAnalysis {
+        var lastError: Error = AnalysisError.networkError("Nessun modello Gemini disponibile al momento. Riprova tra poco.")
+
+        for model in candidateModels {
+            try Task.checkCancellation()
+            do {
+                return try await requestSingleModel(model: model, track: track, lyrics: lyrics, apiKey: apiKey)
+            } catch AttemptError.fatal(let error) {
+                throw error
+            } catch AttemptError.retryable(let error) {
+                lastError = error
+                continue
+            } catch {
+                if error is CancellationError {
+                    throw error
+                }
+                if let urlError = error as? URLError, urlError.code == .cancelled {
+                    throw error
+                }
+                lastError = error
+                continue
+            }
+        }
+
+        throw lastError
+    }
+
+    private func requestSingleModel(model: String, track: CurrentTrack, lyrics: String?, apiKey: String) async throws -> TrackAnalysis {
+        let urlString = "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent?key=\(apiKey)"
         guard let url = URL(string: urlString) else {
-            throw AnalysisError.invalidURL
+            throw AttemptError.fatal(AnalysisError.invalidURL)
         }
 
         let lyricsSection: String
         if let lyrics {
+            let trimmedLyrics = String(lyrics.prefix(3500))
             lyricsSection = """
-            Ecco il testo ufficiale del brano (usalo come riferimento principale):
-            ---
-            \(lyrics)
-            ---
+            Testo del brano:
+            \(trimmedLyrics)
             """
         } else {
-            lyricsSection = """
-            Il testo integrale non è disponibile: basati solo sulla tua conoscenza accertata del brano senza inventare versi.
-            """
+            lyricsSection = "Testo non disponibile: basati solo su informazioni certe senza inventare versi."
         }
 
         let prompt = """
-        Sei un critico musicale. Analizza in italiano, in modo chiaro, concreto e sintetico, il seguente brano:
-        - Titolo: \(track.title)
-        - Artista: \(track.artist)
-        - Album: \(track.album.isEmpty ? "Non specificato" : track.album)
+        Sei un critico musicale. Analizza in italiano, in modo chiaro e sintetico, questo brano:
+        Titolo: \(track.title)
+        Artista: \(track.artist)
+        Album: \(track.album.isEmpty ? "Non specificato" : track.album)
 
         \(lyricsSection)
 
-        Restituisci un JSON con esattamente questi tre campi (massimo 120 parole per campo, usa \\n\\n tra i paragrafi):
-        1. "storyAndReason": storia del brano, com'è nato e motivo per cui è stato scritto.
-        2. "context": contesto storico, culturale e della carriera dell'artista o dell'album.
-        3. "lyricsExplanation": spiegazione del significato del testo, temi principali e metafore chiave.
+        Rispondi SOLO con un oggetto JSON valido con queste 3 chiavi esatte (massimo 100 parole per chiave):
+        {
+          "storyAndReason": "storia del brano e motivo per cui è stato scritto",
+          "context": "contesto storico, culturale e della carriera dell'artista",
+          "lyricsExplanation": "spiegazione del significato del testo e delle metafore principali"
+        }
         """
 
         let body = GeminiRequest(
             contents: [.init(parts: [.init(text: prompt)])],
             generationConfig: .init(
                 responseMimeType: "application/json",
-                responseSchema: .init(
-                    type: "OBJECT",
-                    properties: [
-                        "storyAndReason": .init(type: "STRING"),
-                        "context": .init(type: "STRING"),
-                        "lyricsExplanation": .init(type: "STRING")
-                    ],
-                    required: ["storyAndReason", "context", "lyricsExplanation"]
-                )
+                maxOutputTokens: 1500,
+                temperature: 0.5
             )
         )
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 120
+        request.timeoutInterval = 25
+        request.assumesHTTP3Capable = false
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(body)
 
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 120
-        config.timeoutIntervalForResource = 120
+        let config = URLSessionConfiguration.ephemeral
+        config.timeoutIntervalForRequest = 25
+        config.timeoutIntervalForResource = 30
+        config.waitsForConnectivity = false
         let session = URLSession(configuration: config)
         defer { session.finishTasksAndInvalidate() }
 
         let (data, response) = try await session.data(for: request)
         let decoded = try? JSONDecoder().decode(GeminiResponse.self, from: data)
+        let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
 
-        if let apiError = decoded?.error?.message {
-            throw AnalysisError.networkError("Errore Gemini API: \(apiError)")
+        if statusCode == 401 || statusCode == 403 {
+            let msg = decoded?.error?.message ?? "Chiave API non valida o non autorizzata (HTTP \(statusCode))."
+            throw AttemptError.fatal(AnalysisError.networkError(msg))
         }
 
-        if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
-            throw AnalysisError.networkError("Errore HTTP \(http.statusCode). Controlla la tua chiave API.")
+        if !(200...299).contains(statusCode) {
+            let msg = decoded?.error?.message ?? "Errore HTTP \(statusCode) sul modello \(model)."
+            throw AttemptError.retryable(AnalysisError.networkError(msg))
         }
 
         guard let rawText = decoded?.candidates?.first?.content?.parts?.first?.text else {
-            throw AnalysisError.decodingError
+            throw AttemptError.retryable(AnalysisError.decodingError)
         }
 
-        let cleanedJSON = rawText
+        let cleaned = rawText
             .replacingOccurrences(of: "```json", with: "")
             .replacingOccurrences(of: "```", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        guard let jsonData = cleanedJSON.data(using: .utf8),
+        let jsonString: String
+        if let start = cleaned.firstIndex(of: "{"),
+           let end = cleaned.lastIndex(of: "}") {
+            jsonString = String(cleaned[start...end])
+        } else {
+            jsonString = cleaned
+        }
+
+        guard let jsonData = jsonString.data(using: .utf8),
               let parsed = try? JSONDecoder().decode(ParsedGeminiJSON.self, from: jsonData) else {
-            throw AnalysisError.decodingError
+            throw AttemptError.retryable(AnalysisError.decodingError)
         }
 
         return TrackAnalysis(

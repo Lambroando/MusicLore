@@ -12,6 +12,16 @@ jobs:
       - name: Scarica il codice
         uses: actions/checkout@v4
 
+      - name: Normalizza icona in PNG 1024x1024
+        run: |
+          ICON="Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png"
+          if [ ! -f "$ICON" ]; then
+            echo "ERRORE: File $ICON non trovato nel repository!"
+            find Sources -maxdepth 4
+            exit 1
+          fi
+          sips -s format png -z 1024 1024 "$ICON" --out "$ICON"
+
       - name: Installa XcodeGen
         run: brew install xcodegen
 
@@ -30,6 +40,19 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             SYMROOT=build \
             build
+
+      - name: Verifica icona compilata nel bundle
+        run: |
+          ls -la build/Release-iphoneos/MusicLore.app
+          plutil -p build/Release-iphoneos/MusicLore.app/Info.plist
+          if [ ! -f "build/Release-iphoneos/MusicLore.app/Assets.car" ]; then
+            echo "ERRORE: Assets.car non generato!"
+            exit 1
+          fi
+          if ! plutil -p build/Release-iphoneos/MusicLore.app/Info.plist | grep -q "CFBundleIcons"; then
+            echo "ERRORE: CFBundleIcons mancante in Info.plist!"
+            exit 1
+          fi
 
       - name: Impacchetta file .ipa
         run: |

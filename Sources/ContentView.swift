@@ -1,54 +1,33 @@
+import MediaPlayer
 import SwiftUI
 import UIKit
 
 struct ContentView: View {
-    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var nowPlaying = NowPlayingManager()
     @StateObject private var analysisService = AnalysisService()
 
-    @State private var manualTrack: CurrentTrack?
     @State private var showSettings = false
     @State private var showManualSearch = false
-    @State private var searchTitle = ""
-    @State private var searchArtist = ""
-    @State private var searchAlbum = ""
-
-    private var displayedTrack: CurrentTrack? {
-        manualTrack ?? nowPlaying.currentTrack
-    }
-
-    private var displayedTrackKey: String {
-        guard let track = displayedTrack else { return "" }
-        return "\(track.artist)|\(track.title)"
-    }
-
-    private var nowPlayingKey: String {
-        guard let track = nowPlaying.currentTrack else { return "" }
-        return "\(track.artist)|\(track.title)"
-    }
 
     var body: some View {
         NavigationStack {
-            ZStack {
-                backgroundLayer
-
-                ScrollView {
-                    VStack(spacing: 20) {
-                        if nowPlaying.authorizationDenied && manualTrack == nil {
-                            permissionDeniedView
-                        } else if let track = displayedTrack {
-                            trackHeader(track)
-                            analysisSection(for: track)
-                        } else {
-                            emptyStateView
-                        }
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(spacing: 18) {
+                    if let track = nowPlaying.currentTrack {
+                        trackHeader(track)
+                        analysisContent(track)
+                    } else {
+                        emptyStateView
                     }
-                    .padding(.horizontal, 18)
-                    .padding(.top, 12)
-                    .padding(.bottom, 40)
                 }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 16)
+                .frame(maxWidth: .infinity)
             }
-            .navigationTitle("MusicLore")
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background {
+                backgroundView
+            }
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
@@ -56,268 +35,257 @@ struct ContentView: View {
                         showManualSearch = true
                     } label: {
                         Image(systemName: "magnifyingglass")
+                            .font(.headline)
                     }
+                }
+
+                ToolbarItem(placement: .principal) {
+                    Text("MusicLore")
+                        .font(.headline.bold())
+                        .foregroundStyle(.white)
                 }
 
                 ToolbarItemGroup(placement: .topBarTrailing) {
                     Button {
-                        manualTrack = nil
-                        nowPlaying.refreshNowPlaying()
+                        nowPlaying.refreshFromAppleMusic(clearManual: true)
                         if let track = nowPlaying.currentTrack {
-                            Task { await analysisService.analyze(track: track, forceRefresh: false) }
+                            Task {
+                                await analysisService.analyze(track: track, forceRefresh: true)
+                            }
                         }
                     } label: {
                         Image(systemName: "arrow.clockwise")
+                            .font(.headline)
                     }
 
                     Button {
                         showSettings = true
                     } label: {
-                        Image(systemName: analysisService.hasAPIKey ? "gearshape" : "gearshape.fill")
-                            .foregroundStyle(analysisService.hasAPIKey ? Color.primary : Color.orange)
+                        Image(systemName: "gearshape")
+                            .font(.headline)
+                            .foregroundStyle(.white)
                     }
                 }
             }
-            .sheet(isPresented: $showSettings) {
-                settingsSheet
+            .sheet(isPresented: $showSettings, onDismiss: {
+                if analysisService.hasAPIKey,
+                   analysisService.analysis == nil,
+                   let track = nowPlaying.currentTrack {
+                    Task {
+                        await analysisService.analyze(track: track)
+                    }
+                }
+            }) {
+                SettingsSheet(analysisService: analysisService)
             }
             .sheet(isPresented: $showManualSearch) {
-                manualSearchSheet
+                ManualSearchSheet { title, artist, album in
+                    nowPlaying.setManualTrack(title: title, artist: artist, album: album)
+                }
             }
             .onAppear {
                 nowPlaying.requestPermissionAndRefresh()
             }
-            .onChange(of: scenePhase) { _, newPhase in
-                if newPhase == .active {
-                    nowPlaying.refreshNowPlaying()
-                }
-            }
-            .onChange(of: nowPlayingKey) { _, newValue in
-                if !newValue.isEmpty {
-                    manualTrack = nil
-                }
-            }
-            .onChange(of: displayedTrackKey) { _, newValue in
-                guard !newValue.isEmpty, let track = displayedTrack else { return }
-                Task {
-                    await analysisService.analyze(track: track, forceRefresh: false)
-                }
+            .task(id: nowPlaying.currentTrack?.id) {
+                guard let track = nowPlaying.currentTrack else { return }
+                await analysisService.analyze(track: track)
             }
         }
+        .preferredColorScheme(.dark)
     }
 
-    // MARK: - Sfondo dinamico dalla copertina
+    // MARK: - Sfondo vincolato allo schermo
 
-    @ViewBuilder
-    private var backgroundLayer: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
+    private var backgroundView: some View {
+        GeometryReader { geo in
+            ZStack {
+                Color.black
 
-            if let artwork = displayedTrack?.artwork {
-                Image(uiImage: artwork)
-                    .resizable()
-                    .scaledToFill()
-                    .blur(radius: 55)
-                    .opacity(0.42)
-                    .ignoresSafeArea()
+                if let artwork = nowPlaying.currentTrack?.artwork {
+                    Image(uiImage: artwork)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .clipped()
+                        .blur(radius: 45)
+                        .opacity(0.28)
+                }
+
+                LinearGradient(
+                    colors: [Color.black.opacity(0.35), Color.black.opacity(0.88)],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
             }
-
-            LinearGradient(
-                colors: [Color.black.opacity(0.35), Color.black.opacity(0.88)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea()
+            .frame(width: geo.size.width, height: geo.size.height)
+            .clipped()
         }
+        .ignoresSafeArea()
     }
 
     // MARK: - Intestazione brano
 
     private func trackHeader(_ track: CurrentTrack) -> some View {
-        VStack(spacing: 14) {
+        VStack(spacing: 10) {
             if let artwork = track.artwork {
                 Image(uiImage: artwork)
                     .resizable()
                     .scaledToFill()
                     .frame(width: 210, height: 210)
-                    .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
-                    .shadow(color: .black.opacity(0.55), radius: 22, y: 12)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .shadow(color: .black.opacity(0.45), radius: 14, y: 6)
             } else {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .frame(width: 180, height: 180)
-                    .overlay {
-                        Image(systemName: "music.note")
-                            .font(.system(size: 54))
-                            .foregroundStyle(.secondary)
-                    }
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                    Image(systemName: "music.note")
+                        .font(.system(size: 56))
+                        .foregroundStyle(.white.opacity(0.45))
+                }
+                .frame(width: 170, height: 170)
             }
 
-            VStack(spacing: 5) {
-                Text(track.title)
-                    .font(.title2.bold())
-                    .multilineTextAlignment(.center)
+            Text(track.title)
+                .font(.title2.bold())
+                .foregroundStyle(.white)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
 
-                Text(track.artist)
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
+            Text(track.artist)
+                .font(.headline)
+                .foregroundStyle(.white.opacity(0.8))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
 
-                if !track.album.isEmpty {
-                    Text(track.album)
-                        .font(.subheadline)
-                        .foregroundStyle(.tertiary)
-                        .multilineTextAlignment(.center)
-                }
+            if !track.album.isEmpty {
+                Text(track.album)
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.55))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
             }
 
-            if manualTrack != nil {
-                Button("Torna al brano su Apple Music") {
-                    manualTrack = nil
-                    nowPlaying.refreshNowPlaying()
+            if nowPlaying.isManualTrack {
+                Button {
+                    nowPlaying.refreshFromAppleMusic(clearManual: true)
+                } label: {
+                    Label("Torna ad Apple Music", systemImage: "music.note.list")
+                        .font(.caption.weight(.medium))
                 }
-                .font(.caption.weight(.semibold))
                 .buttonStyle(.bordered)
+                .tint(.blue)
+                .padding(.top, 2)
             }
         }
-        .padding(.top, 8)
+        .frame(maxWidth: .infinity)
     }
 
-    // MARK: - Schede di analisi
+    // MARK: - Contenuto analisi
 
     @ViewBuilder
-    private func analysisSection(for track: CurrentTrack) -> some View {
+    private func analysisContent(_ track: CurrentTrack) -> some View {
         if analysisService.isLoading {
-            VStack(spacing: 14) {
+            VStack(spacing: 12) {
                 ProgressView()
                     .controlSize(.large)
-                Text("Cerco testo e storia del brano...")
+                    .tint(.white)
+                Text("Analisi del brano in corso...")
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.white.opacity(0.75))
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 36)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .padding(24)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         } else if let error = analysisService.errorMessage {
-            VStack(spacing: 14) {
+            VStack(spacing: 12) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .font(.title2)
                     .foregroundStyle(.orange)
 
                 Text(error)
                     .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.85))
                     .multilineTextAlignment(.center)
-                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity)
 
-                HStack(spacing: 12) {
-                    if !analysisService.hasAPIKey {
-                        Button("Inserisci chiave API") {
-                            showSettings = true
-                        }
-                        .buttonStyle(.borderedProminent)
+                Button("Riprova") {
+                    Task {
+                        await analysisService.analyze(track: track, forceRefresh: true)
                     }
-
-                    Button("Riprova") {
-                        Task { await analysisService.analyze(track: track, forceRefresh: true) }
-                    }
-                    .buttonStyle(.bordered)
                 }
+                .buttonStyle(.borderedProminent)
+                .tint(.white.opacity(0.15))
+                .foregroundStyle(.blue)
             }
             .frame(maxWidth: .infinity)
-            .padding(20)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-        } else if let result = analysisService.analysis {
-            VStack(spacing: 16) {
-                HStack(spacing: 8) {
-                    Label(
-                        result.lyricsFound ? "Testo verificato" : "Analisi da archivio AI",
-                        systemImage: result.lyricsFound ? "checkmark.seal.fill" : "sparkles"
-                    )
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(result.lyricsFound ? .green : .secondary)
-
-                    if analysisService.isFromCache {
-                        Text("• Salvata in cache")
-                            .font(.caption)
+            .padding(18)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        } else if let analysis = analysisService.analysis {
+            VStack(spacing: 14) {
+                HStack(spacing: 10) {
+                    if analysis.lyricsFound {
+                        Label("Testo verificato", systemImage: "checkmark.seal.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.green)
+                    } else {
+                        Label("Analisi da metadati", systemImage: "info.circle.fill")
+                            .font(.caption.weight(.semibold))
                             .foregroundStyle(.secondary)
                     }
+
+                    if analysisService.isFromCache {
+                        Label("In cache", systemImage: "bolt.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.blue)
+                    }
                 }
+                .frame(maxWidth: .infinity)
 
-                analysisCard(
-                    title: "Storia e motivo",
-                    icon: "book.pages.fill",
-                    accent: .pink,
-                    content: result.storyAndReason
-                )
-
-                analysisCard(
-                    title: "Contesto",
-                    icon: "clock.arrow.circlepath",
-                    accent: .cyan,
-                    content: result.context
-                )
-
-                analysisCard(
-                    title: "Spiegazione del testo",
-                    icon: "quote.bubble.fill",
-                    accent: .purple,
-                    content: result.lyricsExplanation
-                )
-
-                Button {
-                    Task { await analysisService.analyze(track: track, forceRefresh: true) }
-                } label: {
-                    Label("Rigenera analisi", systemImage: "sparkles")
-                        .font(.subheadline.weight(.medium))
-                }
-                .buttonStyle(.bordered)
-                .padding(.top, 4)
+                AnalysisCard(title: "Storia e motivo", text: analysis.storyAndReason)
+                AnalysisCard(title: "Contesto", text: analysis.context)
+                AnalysisCard(title: "Spiegazione del testo", text: analysis.lyricsExplanation)
             }
+            .frame(maxWidth: .infinity)
         }
     }
 
-    private func analysisCard(title: String, icon: String, accent: Color, content: String) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Image(systemName: icon)
-                    .foregroundStyle(accent)
-                Text(title)
-                    .font(.headline)
-            }
-
-            Text(content)
-                .font(.body)
-                .lineSpacing(5)
-                .foregroundStyle(.primary.opacity(0.92))
-                .textSelection(.enabled)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(18)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
-    }
-
-    // MARK: - Stati vuoti / permessi
+    // MARK: - Stato vuoto
 
     private var emptyStateView: some View {
         VStack(spacing: 16) {
-            Image(systemName: "music.note.list")
+            Image(systemName: "music.note.house.fill")
                 .font(.system(size: 52))
-                .foregroundStyle(.pink)
+                .foregroundStyle(.white.opacity(0.6))
 
             Text("Nessun brano in riproduzione")
                 .font(.title3.bold())
-
-            Text("Fai partire una canzone su Apple Music e torna qui, oppure cercane una manualmente.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.white)
                 .multilineTextAlignment(.center)
+
+            Text("Avvia una canzone su Apple Music e premi Aggiorna, oppure cerca un brano manualmente.")
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.7))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if nowPlaying.authorizationStatus == .denied || nowPlaying.authorizationStatus == .restricted {
+                Button("Apri Impostazioni per Apple Music") {
+                    if let url = URL(string: UIApplication.openSettingsURLString) {
+                        UIApplication.shared.open(url)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+            }
 
             HStack(spacing: 12) {
                 Button("Aggiorna") {
-                    nowPlaying.refreshNowPlaying()
+                    nowPlaying.requestPermissionAndRefresh()
                 }
                 .buttonStyle(.borderedProminent)
-                .tint(.pink)
 
                 Button("Cerca brano") {
                     showManualSearch = true
@@ -325,101 +293,130 @@ struct ContentView: View {
                 .buttonStyle(.bordered)
             }
         }
-        .padding(28)
-        .padding(.top, 50)
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .padding(.top, 40)
     }
+}
 
-    private var permissionDeniedView: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "lock.shield.fill")
-                .font(.system(size: 50))
-                .foregroundStyle(.orange)
+// MARK: - Card testo
 
-            Text("Accesso ad Apple Music negato")
-                .font(.title3.bold())
+private struct AnalysisCard: View {
+    let title: String
+    let text: String
 
-            Text("Per leggere automaticamente il brano in ascolto, attiva \"Contenuti multimediali e Apple Music\" nelle Impostazioni di iOS.")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline.bold())
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            Button("Apri Impostazioni iOS") {
-                if let url = URL(string: UIApplication.openSettingsURLString) {
-                    UIApplication.shared.open(url)
-                }
-            }
-            .buttonStyle(.borderedProminent)
+            Text(text)
+                .font(.body)
+                .foregroundStyle(.white.opacity(0.9))
+                .lineSpacing(4)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
-        .padding(28)
-        .padding(.top, 50)
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
+}
 
-    // MARK: - Impostazioni & Ricerca Manuale
+// MARK: - Impostazioni
 
-    private var settingsSheet: some View {
+private struct SettingsSheet: View {
+    @ObservedObject var analysisService: AnalysisService
+    @Environment(\.dismiss) private var dismiss
+    @State private var cacheCleared = false
+
+    var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    SecureField("Incolla la Gemini API Key", text: $analysisService.apiKey)
+                    TextField("Incolla la tua Gemini API Key", text: $analysisService.apiKey)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                 } header: {
-                    Text("Google AI Studio (Gemini API)")
+                    Text("Google AI Studio API Key")
                 } footer: {
-                    Text("La chiave resta salvata solo sul tuo iPhone. Puoi crearla gratis su aistudio.google.com.")
+                    Text("La chiave viene salvata solo in locale sul tuo iPhone.")
                 }
 
-                Section("Archivio locale") {
-                    Button("Svuota cache delle analisi", role: .destructive) {
+                Section("Cache locale") {
+                    Button(role: .destructive) {
                         analysisService.clearCache()
+                        cacheCleared = true
+                    } label: {
+                        Text("Svuota cache dei brani analizzati")
+                    }
+
+                    if cacheCleared {
+                        Text("Cache svuotata.")
+                            .font(.caption)
+                            .foregroundStyle(.green)
                     }
                 }
             }
             .navigationTitle("Impostazioni")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Fine") {
-                        showSettings = false
-                        if let track = displayedTrack, analysisService.hasAPIKey, analysisService.analysis == nil {
-                            Task { await analysisService.analyze(track: track, forceRefresh: false) }
-                        }
+                        dismiss()
                     }
                 }
             }
         }
+        .preferredColorScheme(.dark)
+    }
+}
+
+// MARK: - Ricerca manuale
+
+private struct ManualSearchSheet: View {
+    let onSelect: (String, String, String) -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var title = ""
+    @State private var artist = ""
+    @State private var album = ""
+
+    private var canSubmit: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        !artist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private var manualSearchSheet: some View {
+    var body: some View {
         NavigationStack {
             Form {
                 Section("Dettagli brano") {
-                    TextField("Titolo canzone", text: $searchTitle)
-                    TextField("Artista", text: $searchArtist)
-                    TextField("Album (opzionale)", text: $searchAlbum)
+                    TextField("Titolo del brano", text: $title)
+                    TextField("Artista", text: $artist)
+                    TextField("Album (opzionale)", text: $album)
+                }
+
+                Section {
+                    Button("Analizza brano") {
+                        onSelect(title, artist, album)
+                        dismiss()
+                    }
+                    .disabled(!canSubmit)
                 }
             }
-            .navigationTitle("Cerca manualmente")
+            .navigationTitle("Cerca brano")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     Button("Annulla") {
-                        showManualSearch = false
+                        dismiss()
                     }
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("Analizza") {
-                        let title = searchTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let artist = searchArtist.trimmingCharacters(in: .whitespacesAndNewlines)
-                        let album = searchAlbum.trimmingCharacters(in: .whitespacesAndNewlines)
-                        guard !title.isEmpty, !artist.isEmpty else { return }
-                        manualTrack = CurrentTrack(title: title, artist: artist, album: album, artwork: nil)
-                        showManualSearch = false
-                    }
-                    .disabled(
-                        searchTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                        searchArtist.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    )
                 }
             }
         }
+        .preferredColorScheme(.dark)
     }
 }

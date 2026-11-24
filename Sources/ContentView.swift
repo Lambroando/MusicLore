@@ -16,6 +16,8 @@ struct ContentView: View {
     @State private var selectedCategory: AnalysisCategory = .song
     @State private var showSettings = false
     @State private var showManualSearch = false
+    @State private var questionText = ""
+    @FocusState private var isQuestionFocused: Bool
 
     private var activeTaskID: String {
         "\(nowPlaying.currentTrack?.id ?? "none")|\(selectedCategory.rawValue)"
@@ -33,6 +35,7 @@ struct ContentView: View {
                         } else {
                             albumAnalysisContent(track)
                         }
+                        qaSection(track)
                     } else {
                         emptyStateView
                     }
@@ -41,6 +44,7 @@ struct ContentView: View {
                 .padding(.vertical, 16)
                 .frame(maxWidth: .infinity)
             }
+            .scrollDismissesKeyboard(.interactively)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background {
                 backgroundView
@@ -116,6 +120,7 @@ struct ContentView: View {
             }
             .task(id: activeTaskID) {
                 guard let track = nowPlaying.currentTrack else { return }
+                analysisService.qaErrorMessage = nil
                 switch selectedCategory {
                 case .song:
                     await analysisService.analyze(track: track)
@@ -264,6 +269,7 @@ struct ContentView: View {
                 AnalysisCard(title: "Storia e motivo", text: analysis.storyAndReason)
                 AnalysisCard(title: "Contesto", text: analysis.context)
                 AnalysisCard(title: "Spiegazione del testo", text: analysis.lyricsExplanation)
+                AnalysisCard(title: "Curiosità e retroscena", text: analysis.curiosities)
             }
             .frame(maxWidth: .infinity)
         }
@@ -297,6 +303,106 @@ struct ContentView: View {
                 AnalysisCard(title: "Curiosità e retroscena", text: album.curiosities)
             }
             .frame(maxWidth: .infinity)
+        }
+    }
+
+    // MARK: - Sezione domande specifiche (con verifica fonti)
+
+    private func qaSection(_ track: CurrentTrack) -> some View {
+        let items = analysisService.qaItems(for: track)
+
+        return VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Chiedi qualcosa", systemImage: "bubble.left.and.text.bubble.right.fill")
+                        .font(.headline.bold())
+                        .foregroundStyle(.white)
+
+                    Text("Cerca online e verifica le fonti su questo brano o album.")
+                        .font(.caption)
+                        .foregroundStyle(.white.opacity(0.6))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if !items.isEmpty {
+                    Button("Pulisci") {
+                        analysisService.clearQA(for: track)
+                    }
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.7))
+                }
+            }
+
+            if !items.isEmpty {
+                VStack(spacing: 12) {
+                    ForEach(items) { item in
+                        QACardView(item: item)
+                    }
+                }
+            }
+
+            if analysisService.isAnsweringQuestion {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .tint(.white)
+                    Text("Controllo le fonti online e preparo la risposta...")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.8))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(14)
+                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+            }
+
+            if let qaError = analysisService.qaErrorMessage {
+                Text(qaError)
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
+            HStack(alignment: .bottom, spacing: 10) {
+                TextField("Es. Chi ha prodotto il beat? Che sample usa?", text: $questionText, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.plain)
+                    .foregroundStyle(.white)
+                    .focused($isQuestionFocused)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                Button {
+                    submitQuestion(for: track)
+                } label: {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 34))
+                        .foregroundStyle(canSendQuestion ? .blue : .white.opacity(0.25))
+                }
+                .disabled(!canSendQuestion)
+            }
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .padding(.top, 6)
+    }
+
+    private var canSendQuestion: Bool {
+        !questionText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !analysisService.isAnsweringQuestion
+    }
+
+    private func submitQuestion(for track: CurrentTrack) {
+        let prompt = questionText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !prompt.isEmpty else { return }
+        questionText = ""
+        isQuestionFocused = false
+        let focus = selectedCategory.rawValue
+
+        Task {
+            await analysisService.askQuestion(prompt, for: track, focusCategory: focus)
         }
     }
 
@@ -382,6 +488,78 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
         .padding(24)
         .padding(.top, 40)
+    }
+}
+
+// MARK: - Card singola domanda/risposta
+
+private struct QACardView: View {
+    let item: QAItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(item.question)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color.blue.opacity(0.24), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            Text(item.answer)
+                .font(.body)
+                .foregroundStyle(.white.opacity(0.92))
+                .lineSpacing(4)
+                .multilineTextAlignment(.leading)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            HStack(spacing: 6) {
+                if item.webVerified {
+                    Label("Verificato online", systemImage: "checkmark.shield.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.green)
+                } else {
+                    Label("Senza ricerca web", systemImage: "exclamationmark.circle.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.orange)
+                }
+            }
+
+            if !item.sources.isEmpty {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Fonti consultate:")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.65))
+
+                    ForEach(item.sources.prefix(5)) { source in
+                        Link(destination: source.url) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "link")
+                                    .font(.caption2)
+                                Text(source.title)
+                                    .font(.caption)
+                                    .lineLimit(1)
+                                    .truncationMode(.tail)
+                                Spacer(minLength: 4)
+                                Image(systemName: "arrow.up.right")
+                                    .font(.caption2)
+                            }
+                            .foregroundStyle(.blue)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                        }
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 }
 

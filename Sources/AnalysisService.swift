@@ -5,6 +5,7 @@ struct TrackAnalysis: Codable, Equatable {
     let storyAndReason: String
     let context: String
     let lyricsExplanation: String
+    let curiosities: String
     var lyricsFound: Bool
 }
 
@@ -43,15 +44,45 @@ struct AlbumAnalysis: Codable, Equatable {
     }
 }
 
+struct VerifiedSource: Identifiable, Hashable, Codable {
+    var id: String { url.absoluteString }
+    let title: String
+    let url: URL
+}
+
+struct QAItem: Identifiable, Equatable {
+    let id: UUID
+    let question: String
+    let answer: String
+    let sources: [VerifiedSource]
+    let webVerified: Bool
+
+    init(
+        id: UUID = UUID(),
+        question: String,
+        answer: String,
+        sources: [VerifiedSource],
+        webVerified: Bool
+    ) {
+        self.id = id
+        self.question = question
+        self.answer = answer
+        self.sources = sources
+        self.webVerified = webVerified
+    }
+}
+
 private struct TrackAnalysisPayload: Decodable {
     let storyAndReason: String
     let context: String
     let lyricsExplanation: String
+    let curiosities: String
 
     enum CodingKeys: String, CodingKey {
         case storyAndReason
         case context
         case lyricsExplanation
+        case curiosities
     }
 
     init(from decoder: Decoder) throws {
@@ -59,6 +90,7 @@ private struct TrackAnalysisPayload: Decodable {
         self.storyAndReason = try container.decodeIfPresent(String.self, forKey: .storyAndReason)?.nilIfBlank ?? "Informazioni sulla storia del brano non disponibili."
         self.context = try container.decodeIfPresent(String.self, forKey: .context)?.nilIfBlank ?? "Contesto non disponibile."
         self.lyricsExplanation = try container.decodeIfPresent(String.self, forKey: .lyricsExplanation)?.nilIfBlank ?? "Spiegazione del testo non disponibile."
+        self.curiosities = try container.decodeIfPresent(String.self, forKey: .curiosities)?.nilIfBlank ?? "Nessuna curiosità confermata disponibile per questo brano."
     }
 }
 
@@ -77,11 +109,17 @@ private struct GeminiRequest: Encodable {
 
     struct GenerationConfig: Encodable {
         let temperature: Double
-        let responseMimeType: String
+        let responseMimeType: String?
+    }
+
+    struct Tool: Encodable {
+        struct GoogleSearch: Encodable {}
+        let google_search: GoogleSearch
     }
 
     let contents: [Content]
     let generationConfig: GenerationConfig
+    let tools: [Tool]?
 }
 
 private struct GeminiResponse: Decodable {
@@ -92,7 +130,21 @@ private struct GeminiResponse: Decodable {
             }
             let parts: [Part]?
         }
+
+        struct GroundingMetadata: Decodable {
+            struct GroundingChunk: Decodable {
+                struct Web: Decodable {
+                    let uri: String?
+                    let title: String?
+                }
+                let web: Web?
+            }
+            let webSearchQueries: [String]?
+            let groundingChunks: [GroundingChunk]?
+        }
+
         let content: Content?
+        let groundingMetadata: GroundingMetadata?
     }
 
     struct APIError: Decodable {
@@ -102,6 +154,12 @@ private struct GeminiResponse: Decodable {
 
     let candidates: [Candidate]?
     let error: APIError?
+}
+
+private struct GeminiResult {
+    let text: String
+    let sources: [VerifiedSource]
+    let usedWebSearch: Bool
 }
 
 @MainActor
@@ -124,12 +182,17 @@ final class AnalysisService: ObservableObject {
     @Published var albumErrorMessage: String?
     @Published var isAlbumFromCache = false
 
+    // Stato domande specifiche (Q&A)
+    @Published var qaByTrack: [String: [QAItem]] = [:]
+    @Published var isAnsweringQuestion = false
+    @Published var qaErrorMessage: String?
+
     var hasAPIKey: Bool {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private static let apiKeyStorageKey = "gemini_api_key"
-    private static let trackCacheStorageKey = "musiclore_track_cache_v1"
+    private static let trackCacheStorageKey = "musiclore_track_cache_v2"
     private static let albumCacheStorageKey = "musiclore_album_cache_v1"
 
     private let geminiModels = [
@@ -141,6 +204,7 @@ final class AnalysisService: ObservableObject {
 
     private var trackCache: [String: TrackAnalysis] = [:]
     private var albumCache: [String: AlbumAnalysis] = [:]
+    private var lyricsCache: [String: String] = [:]
     private var activeTrackKey: String?
     private var activeAlbumKey: String?
 
@@ -150,15 +214,27 @@ final class AnalysisService: ObservableObject {
         self.albumCache = Self.loadCache(forKey: Self.albumCacheStorageKey)
     }
 
+    func qaItems(for track: CurrentTrack) -> [QAItem] {
+        qaByTrack[track.id] ?? []
+    }
+
+    func clearQA(for track: CurrentTrack) {
+        qaByTrack[track.id] = []
+        qaErrorMessage = nil
+    }
+
     func clearCache() {
         trackCache.removeAll()
         albumCache.removeAll()
+        lyricsCache.removeAll()
+        qaByTrack.removeAll()
         UserDefaults.standard.removeObject(forKey: Self.trackCacheStorageKey)
         UserDefaults.standard.removeObject(forKey: Self.albumCacheStorageKey)
         analysis = nil
         albumAnalysis = nil
         isFromCache = false
         isAlbumFromCache = false
+        qaErrorMessage = nil
         activeTrackKey = nil
         activeAlbumKey = nil
     }
@@ -196,11 +272,20 @@ final class AnalysisService: ObservableObject {
         analysis = nil
 
         let lyrics = await fetchLyrics(track: track)
+        if let lyrics {
+            lyricsCache[key] = lyrics
+        }
         let prompt = buildTrackPrompt(track: track, lyrics: lyrics)
 
         do {
-            let rawJSON = try await callGeminiWithFallback(prompt: prompt, apiKey: trimmedKey)
-            let cleanedJSON = extractJSONObject(from: rawJSON)
+            let response = try await callGeminiWithFallback(
+                prompt: prompt,
+                apiKey: trimmedKey,
+                responseMimeType: "application/json",
+                useGoogleSearch: false,
+                temperature: 0.35
+            )
+            let cleanedJSON = extractJSONObject(from: response.text)
             guard let data = cleanedJSON.data(using: .utf8) else {
                 throw ServiceError.invalidResponse("Risposta non leggibile dal modello.")
             }
@@ -209,6 +294,7 @@ final class AnalysisService: ObservableObject {
                 storyAndReason: decoded.storyAndReason,
                 context: decoded.context,
                 lyricsExplanation: decoded.lyricsExplanation,
+                curiosities: decoded.curiosities,
                 lyricsFound: lyrics != nil
             )
 
@@ -263,8 +349,14 @@ final class AnalysisService: ObservableObject {
         let prompt = buildAlbumPrompt(track: track)
 
         do {
-            let rawJSON = try await callGeminiWithFallback(prompt: prompt, apiKey: trimmedKey)
-            let cleanedJSON = extractJSONObject(from: rawJSON)
+            let response = try await callGeminiWithFallback(
+                prompt: prompt,
+                apiKey: trimmedKey,
+                responseMimeType: "application/json",
+                useGoogleSearch: false,
+                temperature: 0.35
+            )
+            let cleanedJSON = extractJSONObject(from: response.text)
             guard let data = cleanedJSON.data(using: .utf8) else {
                 throw ServiceError.invalidResponse("Risposta non leggibile dal modello.")
             }
@@ -286,6 +378,70 @@ final class AnalysisService: ObservableObject {
         }
     }
 
+    // MARK: - Domande specifiche con verifica fonti online
+
+    func askQuestion(_ rawQuestion: String, for track: CurrentTrack, focusCategory: String) async {
+        let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !question.isEmpty else { return }
+
+        let trimmedKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKey.isEmpty else {
+            qaErrorMessage = "Inserisci la tua Gemini API Key nelle Impostazioni (icona ingranaggio in alto a destra)."
+            return
+        }
+
+        qaErrorMessage = nil
+        isAnsweringQuestion = true
+        defer { isAnsweringQuestion = false }
+
+        let previousItems = Array((qaByTrack[track.id] ?? []).suffix(4))
+        let lyrics = lyricsCache[track.id]
+        let prompt = buildQuestionPrompt(
+            question: question,
+            track: track,
+            focusCategory: focusCategory,
+            lyrics: lyrics,
+            history: previousItems
+        )
+
+        do {
+            let result: GeminiResult
+            do {
+                result = try await callGeminiWithFallback(
+                    prompt: prompt,
+                    apiKey: trimmedKey,
+                    responseMimeType: nil,
+                    useGoogleSearch: true,
+                    temperature: 0.2
+                )
+            } catch let serviceError as ServiceError {
+                if case .fatal = serviceError {
+                    throw serviceError
+                }
+                // Fallback senza ricerca web solo se nessun modello accetta il tool Google Search
+                result = try await callGeminiWithFallback(
+                    prompt: prompt,
+                    apiKey: trimmedKey,
+                    responseMimeType: nil,
+                    useGoogleSearch: false,
+                    temperature: 0.2
+                )
+            }
+
+            let cleanedAnswer = cleanPlainTextAnswer(result.text)
+            let item = QAItem(
+                question: question,
+                answer: cleanedAnswer,
+                sources: result.sources,
+                webVerified: result.usedWebSearch
+            )
+            qaByTrack[track.id, default: []].append(item)
+            qaErrorMessage = nil
+        } catch {
+            qaErrorMessage = error.localizedDescription
+        }
+    }
+
     // MARK: - Prompt
 
     private func buildTrackPrompt(track: CurrentTrack, lyrics: String?) -> String {
@@ -300,11 +456,11 @@ final class AnalysisService: ObservableObject {
             \"\"\"
             """
         } else {
-            lyricsSection = "Testo non trovato su LRCLib: basati sulle tue conoscenze affidabili senza inventare versi o citazioni inesistenti."
+            lyricsSection = "Testo non trovato su LRCLib: basati solo su informazioni realmente note e verificate, senza inventare versi o citazioni inesistenti."
         }
 
         return """
-        Sei un esperto di storia della musica e critica musicale. Analizza in italiano il seguente brano in modo coinvolgente, chiaro e concreto, senza invenzioni.
+        Sei un esperto di storia della musica e critica musicale. Analizza in italiano il seguente brano in modo coinvolgente, chiaro e concreto, senza inventare dettagli non confermati.
 
         Titolo: \(track.title)
         Artista: \(track.artist)
@@ -312,11 +468,12 @@ final class AnalysisService: ObservableObject {
 
         \(lyricsSection)
 
-        Restituisci ESCLUSIVAMENTE un oggetto JSON valido con queste 3 chiavi esatte (valori in testo semplice, senza Markdown o asterischi):
+        Restituisci ESCLUSIVAMENTE un oggetto JSON valido con queste 4 chiavi esatte (valori in testo semplice, senza Markdown o asterischi):
         {
-          "storyAndReason": "Come nasce il brano, perché è stato scritto, aneddoti sulla creazione o registrazione.",
+          "storyAndReason": "Come nasce il brano, perché è stato scritto, ispirazione e storia della sua creazione.",
           "context": "Il contesto personale, artistico, culturale o storico in cui si inserisce il brano nella carriera dell'artista.",
-          "lyricsExplanation": "Spiegazione chiara del significato del testo, dei temi principali, delle immagini e delle metafore chiave."
+          "lyricsExplanation": "Spiegazione chiara del significato del testo, dei temi principali, delle immagini e delle metafore chiave.",
+          "curiosities": "Curiosità, retroscena di registrazione, campionamenti/sample, citazioni nascoste, produttori, collaborazioni o aneddoti verificati legati al brano."
         }
         """
     }
@@ -344,6 +501,49 @@ final class AnalysisService: ObservableObject {
           "titleMeaning": "Il significato del titolo dell'album e, se rilevante, il legame con la copertina o con il filo conduttore del disco.",
           "curiosities": "Curiosità, retroscena, collaborazioni particolari, impatto o aneddoti interessanti legati all'album."
         }
+        """
+    }
+
+    private func buildQuestionPrompt(
+        question: String,
+        track: CurrentTrack,
+        focusCategory: String,
+        lyrics: String?,
+        history: [QAItem]
+    ) -> String {
+        let albumLine = track.album.isEmpty ? "Non specificato" : track.album
+        let historyBlock: String
+        if history.isEmpty {
+            historyBlock = ""
+        } else {
+            let lines = history.map { "Utente: \($0.question)\nAssistente: \($0.answer)" }.joined(separator: "\n\n")
+            historyBlock = "\nDomande precedenti su questo brano:\n\(lines)\n"
+        }
+
+        let lyricsHint: String
+        if let lyrics {
+            lyricsHint = "\nEstratto del testo verificato del brano (utile se la domanda riguarda versi specifici):\n\"\"\"\n\(String(lyrics.prefix(3500)))\n\"\"\"\n"
+        } else {
+            lyricsHint = ""
+        }
+
+        return """
+        Sei un ricercatore musicale estremamente rigoroso. Devi rispondere in italiano alla domanda dell'utente sul brano o sull'album attualmente in ascolto.
+
+        Contesto attuale:
+        - Categoria attiva nell'app: \(focusCategory)
+        - Brano: \(track.title)
+        - Artista: \(track.artist)
+        - Album: \(albumLine)
+        \(lyricsHint)\(historyBlock)
+        REGOLE OBBLIGATORIE DI VERIFICA:
+        1. Usa la ricerca Google per verificare i fatti, le date, i nomi (produttori, featuring, campionamenti, dichiarazioni in interviste, significato reale) prima di rispondere.
+        2. Incrocia e conferma le informazioni solo da fonti attendibili (interviste ufficiali, crediti discografici, testate musicali serie, database accreditati). Ignora voci infondate o teorie non dimostrate, oppure specificale esplicitamente come ipotesi non confermate.
+        3. ZERO invenzioni: se un dettaglio non è confermato da fonti verificabili, dillo chiaramente ("Non risultano conferme ufficiali su questo punto") invece di tirare a indovinare.
+        4. Rispondi in modo diretto, chiaro e leggibile in testo semplice (non usare asterischi Markdown tipo **grassetto** o elenchi con simboli complessi; se serve andare a capo usa paragrafi puliti).
+
+        Domanda dell'utente:
+        \(question)
         """
     }
 
@@ -426,12 +626,25 @@ final class AnalysisService: ObservableObject {
 
     // MARK: - Chiamata Gemini con fallback
 
-    private func callGeminiWithFallback(prompt: String, apiKey: String) async throws -> String {
+    private func callGeminiWithFallback(
+        prompt: String,
+        apiKey: String,
+        responseMimeType: String?,
+        useGoogleSearch: Bool,
+        temperature: Double
+    ) async throws -> GeminiResult {
         var lastError: Error = ServiceError.invalidResponse("Nessun modello Gemini ha risposto.")
 
         for model in geminiModels {
             do {
-                return try await callGemini(model: model, prompt: prompt, apiKey: apiKey)
+                return try await callGemini(
+                    model: model,
+                    prompt: prompt,
+                    apiKey: apiKey,
+                    responseMimeType: responseMimeType,
+                    useGoogleSearch: useGoogleSearch,
+                    temperature: temperature
+                )
             } catch let serviceError as ServiceError {
                 if case .fatal(let message) = serviceError {
                     throw ServiceError.fatal(message)
@@ -445,7 +658,14 @@ final class AnalysisService: ObservableObject {
         throw lastError
     }
 
-    private func callGemini(model: String, prompt: String, apiKey: String) async throws -> String {
+    private func callGemini(
+        model: String,
+        prompt: String,
+        apiKey: String,
+        responseMimeType: String?,
+        useGoogleSearch: Bool,
+        temperature: Double
+    ) async throws -> GeminiResult {
         var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")
         components?.queryItems = [URLQueryItem(name: "key", value: apiKey)]
 
@@ -455,12 +675,13 @@ final class AnalysisService: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 25
+        request.timeoutInterval = useGoogleSearch ? 35 : 25
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let payload = GeminiRequest(
             contents: [.init(parts: [.init(text: prompt)])],
-            generationConfig: .init(temperature: 0.4, responseMimeType: "application/json")
+            generationConfig: .init(temperature: temperature, responseMimeType: responseMimeType),
+            tools: useGoogleSearch ? [.init(google_search: .init())] : nil
         )
         request.httpBody = try JSONEncoder().encode(payload)
 
@@ -482,10 +703,35 @@ final class AnalysisService: ObservableObject {
         }
 
         let decoded = try JSONDecoder().decode(GeminiResponse.self, from: data)
-        guard let text = decoded.candidates?.first?.content?.parts?.compactMap(\.text).joined().nilIfBlank else {
+        guard let candidate = decoded.candidates?.first,
+              let text = candidate.content?.parts?.compactMap(\.text).joined().nilIfBlank else {
             throw ServiceError.retryable("[\(model)] Risposta vuota.")
         }
-        return text
+
+        var seenURLs = Set<String>()
+        var sources: [VerifiedSource] = []
+        let metadata = candidate.groundingMetadata
+
+        for chunk in metadata?.groundingChunks ?? [] {
+            guard let rawURI = chunk.web?.uri?.nilIfBlank,
+                  let sourceURL = URL(string: rawURI),
+                  let scheme = sourceURL.scheme?.lowercased(),
+                  (scheme == "http" || scheme == "https"),
+                  !seenURLs.contains(sourceURL.absoluteString) else {
+                continue
+            }
+            seenURLs.insert(sourceURL.absoluteString)
+            let label = chunk.web?.title?.nilIfBlank ?? sourceURL.host ?? "Fonte web"
+            sources.append(VerifiedSource(title: label, url: sourceURL))
+        }
+
+        let didSearch = useGoogleSearch && (!sources.isEmpty || !(metadata?.webSearchQueries?.isEmpty ?? true))
+
+        return GeminiResult(
+            text: text,
+            sources: sources,
+            usedWebSearch: didSearch
+        )
     }
 
     // MARK: - Utilità
@@ -510,6 +756,12 @@ final class AnalysisService: ObservableObject {
             return String(cleaned[start...end])
         }
         return cleaned
+    }
+
+    private func cleanPlainTextAnswer(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "**", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func loadCache<T: Decodable>(forKey key: String) -> [String: T] {

@@ -5,6 +5,9 @@ on:
     branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: macos-15
@@ -30,27 +33,26 @@ jobs:
 
       - name: Compila app non firmata
         run: |
+          VERSION="1.0.${{ github.run_number }}"
+          BUILD="${{ github.run_number }}"
           xcodebuild \
             -project MusicLore.xcodeproj \
             -scheme MusicLore \
             -configuration Release \
             -sdk iphoneos \
+            MARKETING_VERSION="$VERSION" \
+            CURRENT_PROJECT_VERSION="$BUILD" \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
             SYMROOT=build \
             build
 
-      - name: Verifica icona compilata nel bundle
+      - name: Verifica icona e versione nel bundle
         run: |
-          ls -la build/Release-iphoneos/MusicLore.app
-          plutil -p build/Release-iphoneos/MusicLore.app/Info.plist
+          plutil -p build/Release-iphoneos/MusicLore.app/Info.plist | grep -E "CFBundleShortVersionString|CFBundleVersion|CFBundleIcons"
           if [ ! -f "build/Release-iphoneos/MusicLore.app/Assets.car" ]; then
             echo "ERRORE: Assets.car non generato!"
-            exit 1
-          fi
-          if ! plutil -p build/Release-iphoneos/MusicLore.app/Info.plist | grep -q "CFBundleIcons"; then
-            echo "ERRORE: CFBundleIcons mancante in Info.plist!"
             exit 1
           fi
 
@@ -65,3 +67,73 @@ jobs:
         with:
           name: MusicLore-IPA
           path: MusicLore.ipa
+
+      - name: Pubblica Release e aggiorna SideStore source.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="1.0.${{ github.run_number }}"
+          BUILD="${{ github.run_number }}"
+          REPO="${{ github.repository }}"
+          TAG="v${VERSION}"
+          IPA_SIZE=$(stat -f%z MusicLore.ipa)
+          NOW_UTC=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" MusicLore.ipa --clobber
+          else
+            gh release create "$TAG" MusicLore.ipa --title "MusicLore $TAG" --notes "$COMMIT_MSG"
+          fi
+
+          python3 - "$VERSION" "$BUILD" "$REPO" "$TAG" "$IPA_SIZE" "$NOW_UTC" "$COMMIT_MSG" << 'EOF'
+          import json, sys
+          version, build, repo, tag, size, date_str, commit_msg = sys.argv[1:]
+          source = {
+              "name": "MusicLore Source",
+              "identifier": "com.personale.musiclore.source",
+              "subtitle": "Aggiornamenti automatici per MusicLore",
+              "apps": [
+                  {
+                      "name": "MusicLore",
+                      "bundleIdentifier": "com.personale.musiclore",
+                      "developerName": repo.split("/")[0],
+                      "subtitle": "Storia e spiegazione dei brani su Apple Music",
+                      "localizedDescription": "App nativa sincronizzata con Apple Music per mostrare storia, contesto e spiegazione del testo dei brani.",
+                      "iconURL": f"https://raw.githubusercontent.com/{repo}/main/Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+                      "tintColor": "#1DB954",
+                      "versions": [
+                          {
+                              "version": version,
+                              "buildVersion": build,
+                              "date": date_str,
+                              "localizedDescription": commit_msg or f"Aggiornamento v{version}",
+                              "downloadURL": f"https://github.com/{repo}/releases/download/{tag}/MusicLore.ipa",
+                              "size": int(size),
+                              "minOSVersion": "17.0"
+                          }
+                      ],
+                      "appPermissions": {
+                          "entitlements": [],
+                          "privacy": {
+                              "NSAppleMusicUsageDescription": "Consente di leggere il brano in riproduzione su Apple Music per mostrarne storia, contesto e spiegazione del testo."
+                          }
+                      }
+                  }
+              ],
+              "news": []
+          }
+          with open("source.json", "w", encoding="utf-8") as f:
+              json.dump(source, f, indent=2, ensure_ascii=False)
+          EOF
+
+          TMP_DIR=$(mktemp -d)
+          cp source.json "$TMP_DIR/source.json"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan sidestore-source
+          git rm -rf . >/dev/null 2>&1 || true
+          cp "$TMP_DIR/source.json" source.json
+          git add source.json
+          git commit -m "Aggiorna source.json per $TAG"
+          git push -f origin sidestore-source

@@ -145,12 +145,17 @@ private struct GeminiResponse: Decodable {
                 let web: Web?
             }
 
+            struct GroundingSupport: Decodable {
+                let groundingChunkIndices: [Int]?
+            }
+
             struct SearchEntryPoint: Decodable {
                 let renderedContent: String?
             }
 
             let webSearchQueries: [String]?
             let groundingChunks: [GroundingChunk]?
+            let groundingSupports: [GroundingSupport]?
             let searchEntryPoint: SearchEntryPoint?
         }
 
@@ -206,14 +211,14 @@ final class AnalysisService: ObservableObject {
     private static let trackCacheStorageKey = "musiclore_track_cache_v3"
     private static let albumCacheStorageKey = "musiclore_album_cache_v2"
 
-    // Ordine ottimizzato per Google Search Grounding obbligatorio
+    // Modelli aggiornati con supporto Google Search Grounding
     private let geminiSearchModels = [
-        "gemini-2.5-flash",
+        "gemini-3.8-flash",
+        "gemini-flash-latest",
         "gemini-3-flash-preview",
-        "gemini-2.5-flash-lite",
+        "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
-        "gemini-flash-lite-latest",
-        "gemini-3.5-flash-lite"
+        "gemini-flash-lite-latest"
     ]
 
     private var trackCache: [String: TrackAnalysis] = [:]
@@ -466,7 +471,7 @@ final class AnalysisService: ObservableObject {
 
         \(lyricsSection)
 
-        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun testo prima o dopo le parentesi graffe, nessun Markdown, usa \\n per eventuali a capo) con queste 4 chiavi esatte:
+        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun testo prima o dopo le parentesi graffe, nessun Markdown, nessun carattere di a capo non escapato dentro le stringhe) con queste 4 chiavi esatte:
         {
           "storyAndReason": "Come nasce il brano, perché è stato scritto, ispirazione e storia verificata della creazione.",
           "context": "Il contesto personale, artistico, culturale o storico in cui si inserisce il brano nella carriera dell'artista.",
@@ -492,7 +497,7 @@ final class AnalysisService: ObservableObject {
         Artista: \(track.artist)
         \(albumInstruction)
 
-        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun testo prima o dopo le parentesi graffe, nessun Markdown, usa \\n per eventuali a capo) con queste 6 chiavi esatte:
+        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun testo prima o dopo le parentesi graffe, nessun Markdown, nessun carattere di a capo non escapato dentro le stringhe) con queste 6 chiavi esatte:
         {
           "albumTitle": "Titolo ufficiale dell'album o EP.",
           "releaseDate": "Data di uscita verificata in italiano (es. '12 novembre 2021').",
@@ -641,7 +646,7 @@ final class AnalysisService: ObservableObject {
                     apiKey: apiKey,
                     temperature: temperature
                 )
-                let cleanedJSON = extractJSONObject(from: result.text)
+                let cleanedJSON = sanitizeJSONControlCharacters(extractJSONObject(from: result.text))
                 guard let data = cleanedJSON.data(using: .utf8) else {
                     throw ServiceError.retryable("[\(model)] JSON non leggibile.")
                 }
@@ -653,12 +658,12 @@ final class AnalysisService: ObservableObject {
                 }
                 failures.append(serviceError.localizedDescription)
             } catch {
-                failures.append("[\(model)] Formato risposta non valido: \(error.localizedDescription)")
+                failures.append("[\(model)] Formato JSON non valido: \(error.localizedDescription)")
             }
         }
 
-        let summary = failures.first ?? "Nessun modello è riuscito a completare la ricerca web."
-        throw ServiceError.invalidResponse("Ricerca web obbligatoria non riuscita su tutti i modelli. Dettaglio: \(summary)")
+        let summary = failures.joined(separator: "\n• ")
+        throw ServiceError.invalidResponse("Ricerca web obbligatoria non riuscita:\n• \(summary)")
     }
 
     private func callGeminiTextWithWebSearch(
@@ -686,8 +691,8 @@ final class AnalysisService: ObservableObject {
             }
         }
 
-        let summary = failures.first ?? "Nessun modello è riuscito a completare la ricerca web."
-        throw ServiceError.invalidResponse("Ricerca web obbligatoria non riuscita. Dettaglio: \(summary)")
+        let summary = failures.joined(separator: "\n• ")
+        throw ServiceError.invalidResponse("Ricerca web obbligatoria non riuscita:\n• \(summary)")
     }
 
     private func callGeminiWithSearch(
@@ -756,8 +761,9 @@ final class AnalysisService: ObservableObject {
         }
 
         let hasQueries = !(metadata?.webSearchQueries?.isEmpty ?? true)
+        let hasSupports = !(metadata?.groundingSupports?.isEmpty ?? true)
         let hasEntryPoint = metadata?.searchEntryPoint?.renderedContent?.nilIfBlank != nil
-        let didSearch = !sources.isEmpty || hasQueries || hasEntryPoint
+        let didSearch = !sources.isEmpty || hasQueries || hasSupports || hasEntryPoint
 
         guard didSearch else {
             throw ServiceError.retryable("[\(model)] Ha risposto senza eseguire la ricerca Google.")
@@ -792,6 +798,40 @@ final class AnalysisService: ObservableObject {
             return String(cleaned[start...end])
         }
         return cleaned
+    }
+
+    private func sanitizeJSONControlCharacters(_ json: String) -> String {
+        var result = ""
+        result.reserveCapacity(json.count)
+        var inString = false
+        var escaped = false
+
+        for ch in json {
+            if inString {
+                if escaped {
+                    result.append(ch)
+                    escaped = false
+                } else if ch == "\\" {
+                    result.append(ch)
+                    escaped = true
+                } else if ch == "\"" {
+                    result.append(ch)
+                    inString = false
+                } else if ch == "\n" || ch == "\r" || ch == "\r\n" {
+                    result.append("\\n")
+                } else if ch == "\t" {
+                    result.append("\\t")
+                } else {
+                    result.append(ch)
+                }
+            } else {
+                if ch == "\"" {
+                    inString = true
+                }
+                result.append(ch)
+            }
+        }
+        return result
     }
 
     private func cleanPlainTextAnswer(_ raw: String) -> String {

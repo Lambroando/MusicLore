@@ -238,7 +238,7 @@ struct ContentView: View {
     @ViewBuilder
     private func songAnalysisContent(_ track: CurrentTrack) -> some View {
         if analysisService.isLoading {
-            loadingCard(message: "Analisi del brano in corso...")
+            loadingCard(message: "Ricerca web e analisi del brano in corso...")
         } else if let error = analysisService.errorMessage {
             errorCard(message: error) {
                 Task {
@@ -248,14 +248,16 @@ struct ContentView: View {
         } else if let analysis = analysisService.analysis {
             VStack(spacing: 14) {
                 HStack(spacing: 10) {
-                    if analysis.lyricsFound {
-                        Label("Testo verificato", systemImage: "checkmark.seal.fill")
+                    if analysis.webVerified {
+                        Label("Verificato online", systemImage: "checkmark.shield.fill")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.green)
-                    } else {
-                        Label("Analisi da metadati", systemImage: "info.circle.fill")
+                    }
+
+                    if analysis.lyricsFound {
+                        Label("Testo OK", systemImage: "checkmark.seal.fill")
                             .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.mint)
                     }
 
                     if analysisService.isFromCache {
@@ -270,6 +272,10 @@ struct ContentView: View {
                 AnalysisCard(title: "Contesto", text: analysis.context)
                 AnalysisCard(title: "Spiegazione del testo", text: analysis.lyricsExplanation)
                 AnalysisCard(title: "Curiosità e retroscena", text: analysis.curiosities)
+
+                if !analysis.sources.isEmpty {
+                    SourcesCard(sources: analysis.sources)
+                }
             }
             .frame(maxWidth: .infinity)
         }
@@ -280,7 +286,7 @@ struct ContentView: View {
     @ViewBuilder
     private func albumAnalysisContent(_ track: CurrentTrack) -> some View {
         if analysisService.isLoadingAlbum {
-            loadingCard(message: "Analisi dell'album in corso...")
+            loadingCard(message: "Ricerca web e analisi dell'album in corso...")
         } else if let error = analysisService.albumErrorMessage {
             errorCard(message: error) {
                 Task {
@@ -289,24 +295,36 @@ struct ContentView: View {
             }
         } else if let album = analysisService.albumAnalysis {
             VStack(spacing: 14) {
-                if analysisService.isAlbumFromCache {
-                    Label("Album in cache", systemImage: "bolt.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.blue)
-                        .frame(maxWidth: .infinity)
+                HStack(spacing: 10) {
+                    if album.webVerified {
+                        Label("Verificato online", systemImage: "checkmark.shield.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.green)
+                    }
+
+                    if analysisService.isAlbumFromCache {
+                        Label("Album in cache", systemImage: "bolt.fill")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.blue)
+                    }
                 }
+                .frame(maxWidth: .infinity)
 
                 AlbumInfoBanner(title: album.albumTitle, releaseDate: album.releaseDate)
                 AnalysisCard(title: "Come nasce l'album", text: album.originAndStory)
                 AnalysisCard(title: "Contesto e obiettivo", text: album.contextAndGoal)
                 AnalysisCard(title: "Significato del titolo", text: album.titleMeaning)
                 AnalysisCard(title: "Curiosità e retroscena", text: album.curiosities)
+
+                if !album.sources.isEmpty {
+                    SourcesCard(sources: album.sources)
+                }
             }
             .frame(maxWidth: .infinity)
         }
     }
 
-    // MARK: - Sezione domande specifiche (con verifica fonti)
+    // MARK: - Sezione domande specifiche (sempre con ricerca web)
 
     private func qaSection(_ track: CurrentTrack) -> some View {
         let items = analysisService.qaItems(for: track)
@@ -318,7 +336,7 @@ struct ContentView: View {
                         .font(.headline.bold())
                         .foregroundStyle(.white)
 
-                    Text("Cerca online e verifica le fonti su questo brano o album.")
+                    Text("Ricerca Google sempre attiva con conferma delle fonti.")
                         .font(.caption)
                         .foregroundStyle(.white.opacity(0.6))
                         .fixedSize(horizontal: false, vertical: true)
@@ -346,7 +364,7 @@ struct ContentView: View {
                 HStack(spacing: 10) {
                     ProgressView()
                         .tint(.white)
-                    Text("Controllo le fonti online e preparo la risposta...")
+                    Text("Cerco su Google e verifico le fonti...")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.8))
                         .fixedSize(horizontal: false, vertical: true)
@@ -416,6 +434,7 @@ struct ContentView: View {
             Text(message)
                 .font(.subheadline)
                 .foregroundStyle(.white.opacity(0.75))
+                .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity)
         .padding(24)
@@ -491,6 +510,52 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Lista fonti verificate
+
+private struct SourcesListView: View {
+    let sources: [VerifiedSource]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Fonti consultate:")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.65))
+
+            ForEach(sources.prefix(6)) { source in
+                Link(destination: source.url) {
+                    HStack(spacing: 6) {
+                        Image(systemName: "link")
+                            .font(.caption2)
+                        Text(source.title)
+                            .font(.caption)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        Spacer(minLength: 4)
+                        Image(systemName: "arrow.up.right")
+                            .font(.caption2)
+                    }
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                }
+            }
+        }
+    }
+}
+
+private struct SourcesCard: View {
+    let sources: [VerifiedSource]
+
+    var body: some View {
+        SourcesListView(sources: sources)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+}
+
 // MARK: - Card singola domanda/risposta
 
 private struct QACardView: View {
@@ -515,46 +580,13 @@ private struct QACardView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            HStack(spacing: 6) {
-                if item.webVerified {
-                    Label("Verificato online", systemImage: "checkmark.shield.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.green)
-                } else {
-                    Label("Senza ricerca web", systemImage: "exclamationmark.circle.fill")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.orange)
-                }
-            }
+            Label("Verificato online", systemImage: "checkmark.shield.fill")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.green)
 
             if !item.sources.isEmpty {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Fonti consultate:")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.white.opacity(0.65))
-
-                    ForEach(item.sources.prefix(5)) { source in
-                        Link(destination: source.url) {
-                            HStack(spacing: 6) {
-                                Image(systemName: "link")
-                                    .font(.caption2)
-                                Text(source.title)
-                                    .font(.caption)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                Spacer(minLength: 4)
-                                Image(systemName: "arrow.up.right")
-                                    .font(.caption2)
-                            }
-                            .foregroundStyle(.blue)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                        }
-                    }
-                }
-                .padding(.top, 2)
+                SourcesListView(sources: item.sources)
+                    .padding(.top, 2)
             }
         }
         .padding(14)

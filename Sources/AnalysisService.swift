@@ -1,7 +1,7 @@
 import Combine
 import Foundation
 
-struct VerifiedSource: Identifiable, Hashable, Codable {
+struct VerifiedSource: Identifiable, Hashable, Codable, Sendable {
     var id: String { url.absoluteString }
     let title: String
     let url: URL
@@ -14,7 +14,7 @@ struct TrackAnalysis: Codable, Equatable {
     let curiosities: String
     var lyricsFound: Bool
     var sources: [VerifiedSource]
-    var webVerified: Bool
+    var sourceSummary: String
 }
 
 struct AlbumAnalysis: Codable, Equatable {
@@ -25,7 +25,7 @@ struct AlbumAnalysis: Codable, Equatable {
     let titleMeaning: String
     let curiosities: String
     var sources: [VerifiedSource]
-    var webVerified: Bool
+    var sourceSummary: String
 }
 
 struct QAItem: Identifiable, Equatable {
@@ -33,20 +33,47 @@ struct QAItem: Identifiable, Equatable {
     let question: String
     let answer: String
     let sources: [VerifiedSource]
-    let webVerified: Bool
+    let sourceSummary: String
 
     init(
         id: UUID = UUID(),
         question: String,
         answer: String,
         sources: [VerifiedSource],
-        webVerified: Bool
+        sourceSummary: String
     ) {
         self.id = id
         self.question = question
         self.answer = answer
         self.sources = sources
-        self.webVerified = webVerified
+        self.sourceSummary = sourceSummary
+    }
+}
+
+private struct WebEvidence: Sendable {
+    let source: VerifiedSource
+    let snippet: String
+    let provider: String
+}
+
+private struct WebBundle: Sendable {
+    let evidences: [WebEvidence]
+    let sources: [VerifiedSource]
+    let summary: String
+    let notice: String?
+
+    var promptContext: String {
+        guard !evidences.isEmpty else {
+            return "Nessuna pagina web pertinente trovata automaticamente. Basati solo su informazioni realmente note e segnala chiaramente qualsiasi dettaglio non confermato."
+        }
+        return evidences.enumerated().map { idx, item in
+            """
+            [FONTE \(idx + 1) - \(item.provider)] \(item.source.title)
+            URL: \(item.source.url.absoluteString)
+            Estratto:
+            \(item.snippet)
+            """
+        }.joined(separator: "\n\n")
     }
 }
 
@@ -68,7 +95,7 @@ private struct TrackAnalysisPayload: Decodable {
         self.storyAndReason = try container.decodeIfPresent(String.self, forKey: .storyAndReason)?.nilIfBlank ?? "Informazioni sulla storia del brano non disponibili."
         self.context = try container.decodeIfPresent(String.self, forKey: .context)?.nilIfBlank ?? "Contesto non disponibile."
         self.lyricsExplanation = try container.decodeIfPresent(String.self, forKey: .lyricsExplanation)?.nilIfBlank ?? "Spiegazione del testo non disponibile."
-        self.curiosities = try container.decodeIfPresent(String.self, forKey: .curiosities)?.nilIfBlank ?? "Nessuna curiosità confermata trovata nelle fonti online."
+        self.curiosities = try container.decodeIfPresent(String.self, forKey: .curiosities)?.nilIfBlank ?? "Nessuna curiosità confermata trovata nelle fonti consultate."
     }
 }
 
@@ -96,13 +123,69 @@ private struct AlbumAnalysisPayload: Decodable {
         self.originAndStory = try container.decodeIfPresent(String.self, forKey: .originAndStory)?.nilIfBlank ?? "Nessuna informazione confermata sulla nascita dell'album."
         self.contextAndGoal = try container.decodeIfPresent(String.self, forKey: .contextAndGoal)?.nilIfBlank ?? "Nessuna informazione confermata sul contesto."
         self.titleMeaning = try container.decodeIfPresent(String.self, forKey: .titleMeaning)?.nilIfBlank ?? "Nessuna informazione confermata sul significato del titolo."
-        self.curiosities = try container.decodeIfPresent(String.self, forKey: .curiosities)?.nilIfBlank ?? "Nessuna curiosità confermata disponibile."
+        self.curiosities = try container.decodeIfPresent(String.self, forKey: .curiosities)?.nilIfBlank ?? "Nessuna curiosità confermata trovata nelle fonti consultate."
     }
 }
 
 private struct LRCLibResponse: Decodable {
     let plainLyrics: String?
     let syncedLyrics: String?
+}
+
+private struct TavilyRequest: Encodable {
+    let api_key: String
+    let query: String
+    let search_depth: String
+    let max_results: Int
+    let include_answer: Bool
+}
+
+private struct TavilyResponse: Decodable {
+    struct Result: Decodable {
+        let title: String?
+        let url: String?
+        let content: String?
+    }
+    let results: [Result]?
+}
+
+private struct WikiSearchResponse: Decodable {
+    struct Query: Decodable {
+        struct SearchItem: Decodable {
+            let pageid: Int
+            let title: String
+        }
+        let search: [SearchItem]?
+    }
+    let query: Query?
+}
+
+private struct WikiExtractResponse: Decodable {
+    struct Query: Decodable {
+        struct Page: Decodable {
+            let pageid: Int?
+            let title: String?
+            let fullurl: String?
+            let extract: String?
+        }
+        let pages: [String: Page]?
+    }
+    let query: Query?
+}
+
+private struct ITunesResponse: Decodable {
+    struct Item: Decodable {
+        let artistName: String?
+        let collectionName: String?
+        let trackName: String?
+        let releaseDate: String?
+        let primaryGenreName: String?
+        let copyright: String?
+        let trackCount: Int?
+        let collectionViewUrl: String?
+        let trackViewUrl: String?
+    }
+    let results: [Item]?
 }
 
 private struct GeminiRequest: Encodable {
@@ -115,16 +198,11 @@ private struct GeminiRequest: Encodable {
 
     struct GenerationConfig: Encodable {
         let temperature: Double
-    }
-
-    struct Tool: Encodable {
-        struct GoogleSearch: Encodable {}
-        let google_search: GoogleSearch
+        let responseMimeType: String?
     }
 
     let contents: [Content]
     let generationConfig: GenerationConfig
-    let tools: [Tool]
 }
 
 private struct GeminiResponse: Decodable {
@@ -135,32 +213,7 @@ private struct GeminiResponse: Decodable {
             }
             let parts: [Part]?
         }
-
-        struct GroundingMetadata: Decodable {
-            struct GroundingChunk: Decodable {
-                struct Web: Decodable {
-                    let uri: String?
-                    let title: String?
-                }
-                let web: Web?
-            }
-
-            struct GroundingSupport: Decodable {
-                let groundingChunkIndices: [Int]?
-            }
-
-            struct SearchEntryPoint: Decodable {
-                let renderedContent: String?
-            }
-
-            let webSearchQueries: [String]?
-            let groundingChunks: [GroundingChunk]?
-            let groundingSupports: [GroundingSupport]?
-            let searchEntryPoint: SearchEntryPoint?
-        }
-
         let content: Content?
-        let groundingMetadata: GroundingMetadata?
     }
 
     struct APIError: Decodable {
@@ -172,17 +225,17 @@ private struct GeminiResponse: Decodable {
     let error: APIError?
 }
 
-private struct GeminiResult {
-    let text: String
-    let sources: [VerifiedSource]
-    let usedWebSearch: Bool
-}
-
 @MainActor
 final class AnalysisService: ObservableObject {
     @Published var apiKey: String {
         didSet {
             UserDefaults.standard.set(apiKey.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.apiKeyStorageKey)
+        }
+    }
+
+    @Published var tavilyApiKey: String {
+        didSet {
+            UserDefaults.standard.set(tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines), forKey: Self.tavilyKeyStorageKey)
         }
     }
 
@@ -202,23 +255,27 @@ final class AnalysisService: ObservableObject {
     @Published var qaByTrack: [String: [QAItem]] = [:]
     @Published var isAnsweringQuestion = false
     @Published var qaErrorMessage: String?
+    @Published var searchNotice: String?
 
     var hasAPIKey: Bool {
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private static let apiKeyStorageKey = "gemini_api_key"
-    private static let trackCacheStorageKey = "musiclore_track_cache_v3"
-    private static let albumCacheStorageKey = "musiclore_album_cache_v2"
+    var hasTavilyKey: Bool {
+        !tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
 
-    // Modelli aggiornati con supporto Google Search Grounding
-    private let geminiSearchModels = [
-        "gemini-3.8-flash",
-        "gemini-flash-latest",
-        "gemini-3-flash-preview",
+    private static let apiKeyStorageKey = "gemini_api_key"
+    private static let tavilyKeyStorageKey = "tavily_api_key"
+    private static let trackCacheStorageKey = "musiclore_track_cache_v4"
+    private static let albumCacheStorageKey = "musiclore_album_cache_v3"
+
+    private let geminiModels = [
         "gemini-3.5-flash-lite",
+        "gemini-flash-lite-latest",
         "gemini-3.1-flash-lite",
-        "gemini-flash-lite-latest"
+        "gemini-3-flash-preview",
+        "gemini-3.8-flash"
     ]
 
     private var trackCache: [String: TrackAnalysis] = [:]
@@ -229,6 +286,7 @@ final class AnalysisService: ObservableObject {
 
     init() {
         self.apiKey = UserDefaults.standard.string(forKey: Self.apiKeyStorageKey) ?? ""
+        self.tavilyApiKey = UserDefaults.standard.string(forKey: Self.tavilyKeyStorageKey) ?? ""
         self.trackCache = Self.loadCache(forKey: Self.trackCacheStorageKey)
         self.albumCache = Self.loadCache(forKey: Self.albumCacheStorageKey)
     }
@@ -254,11 +312,12 @@ final class AnalysisService: ObservableObject {
         isFromCache = false
         isAlbumFromCache = false
         qaErrorMessage = nil
+        searchNotice = nil
         activeTrackKey = nil
         activeAlbumKey = nil
     }
 
-    // MARK: - Analisi Canzone (sempre con ricerca web)
+    // MARK: - Analisi Canzone
 
     func analyze(track: CurrentTrack, forceRefresh: Bool = false) async {
         let key = track.id
@@ -269,6 +328,7 @@ final class AnalysisService: ObservableObject {
 
         activeTrackKey = key
         errorMessage = nil
+        searchNotice = nil
 
         if !forceRefresh, let cached = trackCache[key] {
             analysis = cached
@@ -290,27 +350,46 @@ final class AnalysisService: ObservableObject {
         isFromCache = false
         analysis = nil
 
-        let lyrics = await fetchLyrics(track: track)
+        let trimmedTavily = tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        async let lyricsTask = fetchLyrics(track: track)
+        async let webTask = gatherWebResearch(
+            track: track,
+            tavilyQuery: "\"\(track.title)\" \"\(primaryArtist(from: track.artist))\" \(track.album) significato storia canzone intervista",
+            wikiQuery: "\(primaryArtist(from: track.artist)) \(track.title) \(track.album)",
+            tavilyKey: trimmedTavily,
+            preferAlbumCatalog: false
+        )
+
+        let lyrics = await lyricsTask
+        let web = await webTask
+
         if let lyrics {
             lyricsCache[key] = lyrics
         }
-        let prompt = buildTrackPrompt(track: track, lyrics: lyrics)
+        searchNotice = web.notice
+
+        let prompt = buildTrackPrompt(track: track, lyrics: lyrics, web: web)
 
         do {
-            let (decoded, sources) = try await callGeminiJSONWithWebSearch(
-                as: TrackAnalysisPayload.self,
+            let rawJSON = try await callGeminiWithFallback(
                 prompt: prompt,
                 apiKey: trimmedKey,
-                temperature: 0.2
+                responseMimeType: "application/json",
+                temperature: 0.25
             )
+            let cleanedJSON = sanitizeJSONControlCharacters(extractJSONObject(from: rawJSON))
+            guard let data = cleanedJSON.data(using: .utf8) else {
+                throw ServiceError.invalidResponse("Risposta non leggibile dal modello.")
+            }
+            let decoded = try JSONDecoder().decode(TrackAnalysisPayload.self, from: data)
             let result = TrackAnalysis(
                 storyAndReason: decoded.storyAndReason,
                 context: decoded.context,
                 lyricsExplanation: decoded.lyricsExplanation,
                 curiosities: decoded.curiosities,
                 lyricsFound: lyrics != nil,
-                sources: sources,
-                webVerified: true
+                sources: web.sources,
+                sourceSummary: web.summary
             )
 
             guard activeTrackKey == key else { return }
@@ -329,7 +408,7 @@ final class AnalysisService: ObservableObject {
         }
     }
 
-    // MARK: - Analisi Album (sempre con ricerca web)
+    // MARK: - Analisi Album
 
     func analyzeAlbum(track: CurrentTrack, forceRefresh: Bool = false) async {
         let key = albumCacheKey(for: track)
@@ -340,6 +419,7 @@ final class AnalysisService: ObservableObject {
 
         activeAlbumKey = key
         albumErrorMessage = nil
+        searchNotice = nil
 
         if !forceRefresh, let cached = albumCache[key] {
             albumAnalysis = cached
@@ -361,15 +441,31 @@ final class AnalysisService: ObservableObject {
         isAlbumFromCache = false
         albumAnalysis = nil
 
-        let prompt = buildAlbumPrompt(track: track)
+        let trimmedTavily = tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targetAlbum = track.album.nilIfBlank ?? track.title
+        let web = await gatherWebResearch(
+            track: track,
+            tavilyQuery: "\"\(targetAlbum)\" \"\(primaryArtist(from: track.artist))\" album storia intervista recensione data uscita",
+            wikiQuery: "\(primaryArtist(from: track.artist)) \(targetAlbum) album",
+            tavilyKey: trimmedTavily,
+            preferAlbumCatalog: true
+        )
+        searchNotice = web.notice
+
+        let prompt = buildAlbumPrompt(track: track, web: web)
 
         do {
-            let (decoded, sources) = try await callGeminiJSONWithWebSearch(
-                as: AlbumAnalysisPayload.self,
+            let rawJSON = try await callGeminiWithFallback(
                 prompt: prompt,
                 apiKey: trimmedKey,
-                temperature: 0.2
+                responseMimeType: "application/json",
+                temperature: 0.25
             )
+            let cleanedJSON = sanitizeJSONControlCharacters(extractJSONObject(from: rawJSON))
+            guard let data = cleanedJSON.data(using: .utf8) else {
+                throw ServiceError.invalidResponse("Risposta non leggibile dal modello.")
+            }
+            let decoded = try JSONDecoder().decode(AlbumAnalysisPayload.self, from: data)
             let result = AlbumAnalysis(
                 albumTitle: decoded.albumTitle,
                 releaseDate: decoded.releaseDate,
@@ -377,8 +473,8 @@ final class AnalysisService: ObservableObject {
                 contextAndGoal: decoded.contextAndGoal,
                 titleMeaning: decoded.titleMeaning,
                 curiosities: decoded.curiosities,
-                sources: sources,
-                webVerified: true
+                sources: web.sources,
+                sourceSummary: web.summary
             )
 
             guard activeAlbumKey == key else { return }
@@ -397,7 +493,7 @@ final class AnalysisService: ObservableObject {
         }
     }
 
-    // MARK: - Domande specifiche (sempre con ricerca web obbligatoria)
+    // MARK: - Domande specifiche (con ricerca web reale client-side)
 
     func askQuestion(_ rawQuestion: String, for track: CurrentTrack, focusCategory: String) async {
         let question = rawQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -410,8 +506,20 @@ final class AnalysisService: ObservableObject {
         }
 
         qaErrorMessage = nil
+        searchNotice = nil
         isAnsweringQuestion = true
         defer { isAnsweringQuestion = false }
+
+        let trimmedTavily = tavilyApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let subject = focusCategory == "Album" ? (track.album.nilIfBlank ?? track.title) : track.title
+        let web = await gatherWebResearch(
+            track: track,
+            tavilyQuery: "\(primaryArtist(from: track.artist)) \(subject) \(question)",
+            wikiQuery: "\(primaryArtist(from: track.artist)) \(subject) \(question)",
+            tavilyKey: trimmedTavily,
+            preferAlbumCatalog: focusCategory == "Album"
+        )
+        searchNotice = web.notice
 
         let previousItems = Array((qaByTrack[track.id] ?? []).suffix(4))
         let lyrics = lyricsCache[track.id]
@@ -420,21 +528,23 @@ final class AnalysisService: ObservableObject {
             track: track,
             focusCategory: focusCategory,
             lyrics: lyrics,
+            web: web,
             history: previousItems
         )
 
         do {
-            let result = try await callGeminiTextWithWebSearch(
+            let rawAnswer = try await callGeminiWithFallback(
                 prompt: prompt,
                 apiKey: trimmedKey,
+                responseMimeType: nil,
                 temperature: 0.15
             )
-            let cleanedAnswer = cleanPlainTextAnswer(result.text)
+            let cleanedAnswer = cleanPlainTextAnswer(rawAnswer)
             let item = QAItem(
                 question: question,
                 answer: cleanedAnswer,
-                sources: result.sources,
-                webVerified: result.usedWebSearch
+                sources: web.sources,
+                sourceSummary: web.summary
             )
             qaByTrack[track.id, default: []].append(item)
             qaErrorMessage = nil
@@ -443,27 +553,247 @@ final class AnalysisService: ObservableObject {
         }
     }
 
-    // MARK: - Prompt
+    // MARK: - Motore di ricerca web diretto (Tavily + Wikipedia IT/EN + Catalogo iTunes)
 
-    private func buildTrackPrompt(track: CurrentTrack, lyrics: String?) -> String {
+    private func gatherWebResearch(
+        track: CurrentTrack,
+        tavilyQuery: String,
+        wikiQuery: String,
+        tavilyKey: String,
+        preferAlbumCatalog: Bool
+    ) async -> WebBundle {
+        async let tavilyTask = fetchTavily(query: tavilyQuery, apiKey: tavilyKey)
+        async let wikiITTask = fetchWikipedia(lang: "it", query: wikiQuery, limit: 2)
+        async let wikiENTask = fetchWikipedia(lang: "en", query: wikiQuery, limit: 2)
+        async let itunesTask = fetchITunes(track: track, preferAlbum: preferAlbumCatalog)
+
+        let (tavilyResults, tavilyError) = await tavilyTask
+        let wikiIT = await wikiITTask
+        let wikiEN = await wikiENTask
+        let itunes = await itunesTask
+
+        var combined: [WebEvidence] = []
+        var seenURLs = Set<String>()
+
+        for item in tavilyResults + itunes + wikiIT + wikiEN {
+            let urlKey = item.source.url.absoluteString
+            if !seenURLs.contains(urlKey) {
+                seenURLs.insert(urlKey)
+                combined.append(item)
+            }
+        }
+
+        let sources = combined.map(\.source)
+        var providers: [String] = []
+        if !tavilyResults.isEmpty { providers.append("Web") }
+        if !wikiIT.isEmpty || !wikiEN.isEmpty { providers.append("Wikipedia") }
+        if !itunes.isEmpty { providers.append("Apple Catalog") }
+
+        let summary: String
+        if providers.isEmpty {
+            summary = "Nessuna fonte web trovata"
+        } else {
+            summary = "Fonti: " + providers.joined(separator: " + ")
+        }
+
+        return WebBundle(
+            evidences: combined,
+            sources: sources,
+            summary: summary,
+            notice: tavilyError
+        )
+    }
+
+    private func fetchTavily(query: String, apiKey: String) async -> ([WebEvidence], String?) {
+        guard !apiKey.isEmpty else { return ([], nil) }
+        guard let url = URL(string: "https://api.tavily.com/search") else { return ([], nil) }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 14
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+
+        let body = TavilyRequest(
+            api_key: apiKey,
+            query: query,
+            search_depth: "basic",
+            max_results: 5,
+            include_answer: false
+        )
+
+        do {
+            request.httpBody = try JSONEncoder().encode(body)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return ([], "Tavily: risposta non valida.")
+            }
+            if http.statusCode == 401 || http.statusCode == 403 {
+                return ([], "Chiave Tavily non valida nelle Impostazioni (uso Wikipedia + Catalogo).")
+            }
+            if http.statusCode == 429 || http.statusCode == 432 {
+                return ([], "Quota mensile Tavily esaurita (uso Wikipedia + Catalogo).")
+            }
+            guard (200...299).contains(http.statusCode) else {
+                return ([], "Tavily temporaneamente non disponibile (HTTP \(http.statusCode)).")
+            }
+
+            let decoded = try JSONDecoder().decode(TavilyResponse.self, from: data)
+            let items: [WebEvidence] = (decoded.results ?? []).compactMap { result in
+                guard let rawURL = result.url?.nilIfBlank,
+                      let parsedURL = URL(string: rawURL),
+                      let content = result.content?.nilIfBlank else {
+                    return nil
+                }
+                let title = result.title?.nilIfBlank ?? parsedURL.host ?? "Fonte web"
+                return WebEvidence(
+                    source: VerifiedSource(title: title, url: parsedURL),
+                    snippet: String(content.prefix(1200)),
+                    provider: "Web"
+                )
+            }
+            return (items, nil)
+        } catch {
+            return ([], "Ricerca Tavily non riuscita: uso Wikipedia + Catalogo.")
+        }
+    }
+
+    private func fetchWikipedia(lang: String, query: String, limit: Int) async -> [WebEvidence] {
+        var searchComp = URLComponents(string: "https://\(lang).wikipedia.org/w/api.php")
+        searchComp?.queryItems = [
+            URLQueryItem(name: "action", value: "query"),
+            URLQueryItem(name: "list", value: "search"),
+            URLQueryItem(name: "srsearch", value: query),
+            URLQueryItem(name: "srlimit", value: "\(limit)"),
+            URLQueryItem(name: "utf8", value: "1"),
+            URLQueryItem(name: "format", value: "json")
+        ]
+
+        guard let searchURL = searchComp?.url else { return [] }
+        var searchReq = URLRequest(url: searchURL)
+        searchReq.timeoutInterval = 8
+        searchReq.setValue("MusicLore/1.0 (iOS App)", forHTTPHeaderField: "User-Agent")
+
+        do {
+            let (searchData, searchResp) = try await URLSession.shared.data(for: searchReq)
+            guard let http = searchResp as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            let searchDecoded = try JSONDecoder().decode(WikiSearchResponse.self, from: searchData)
+            let pageIDs = (searchDecoded.query?.search ?? []).map { String($0.pageid) }
+            guard !pageIDs.isEmpty else { return [] }
+
+            var extractComp = URLComponents(string: "https://\(lang).wikipedia.org/w/api.php")
+            extractComp?.queryItems = [
+                URLQueryItem(name: "action", value: "query"),
+                URLQueryItem(name: "prop", value: "extracts|info"),
+                URLQueryItem(name: "inprop", value: "url"),
+                URLQueryItem(name: "explaintext", value: "1"),
+                URLQueryItem(name: "exchars", value: "1800"),
+                URLQueryItem(name: "pageids", value: pageIDs.joined(separator: "|")),
+                URLQueryItem(name: "format", value: "json")
+            ]
+
+            guard let extractURL = extractComp?.url else { return [] }
+            var extractReq = URLRequest(url: extractURL)
+            extractReq.timeoutInterval = 8
+            extractReq.setValue("MusicLore/1.0 (iOS App)", forHTTPHeaderField: "User-Agent")
+
+            let (extractData, extractResp) = try await URLSession.shared.data(for: extractReq)
+            guard let extractHTTP = extractResp as? HTTPURLResponse, (200...299).contains(extractHTTP.statusCode) else {
+                return []
+            }
+            let extractDecoded = try JSONDecoder().decode(WikiExtractResponse.self, from: extractData)
+            let pages = extractDecoded.query?.pages?.values ?? Dictionary<String, WikiExtractResponse.Query.Page>().values
+
+            return pages.compactMap { page in
+                guard let title = page.title?.nilIfBlank,
+                      let rawURL = page.fullurl?.nilIfBlank,
+                      let pageURL = URL(string: rawURL),
+                      let extract = page.extract?.nilIfBlank else {
+                    return nil
+                }
+                return WebEvidence(
+                    source: VerifiedSource(title: "Wikipedia (\(lang.uppercased())): \(title)", url: pageURL),
+                    snippet: String(extract.prefix(1600)),
+                    provider: "Wikipedia \(lang.uppercased())"
+                )
+            }
+        } catch {
+            return []
+        }
+    }
+
+    private func fetchITunes(track: CurrentTrack, preferAlbum: Bool) async -> [WebEvidence] {
+        let term = preferAlbum
+            ? "\(primaryArtist(from: track.artist)) \(track.album.nilIfBlank ?? track.title)"
+            : "\(primaryArtist(from: track.artist)) \(track.title)"
+
+        var components = URLComponents(string: "https://itunes.apple.com/search")
+        components?.queryItems = [
+            URLQueryItem(name: "term", value: term),
+            URLQueryItem(name: "entity", value: preferAlbum ? "album" : "song"),
+            URLQueryItem(name: "country", value: "IT"),
+            URLQueryItem(name: "limit", value: "2")
+        ]
+
+        guard let url = components?.url else { return [] }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 7
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+                return []
+            }
+            let decoded = try JSONDecoder().decode(ITunesResponse.self, from: data)
+            guard let item = decoded.results?.first else { return [] }
+
+            let rawURL = (preferAlbum ? item.collectionViewUrl : (item.trackViewUrl ?? item.collectionViewUrl)) ?? ""
+            guard let itemURL = URL(string: rawURL) else { return [] }
+
+            var lines: [String] = []
+            if let artist = item.artistName?.nilIfBlank { lines.append("Artista catalogo: \(artist)") }
+            if let album = item.collectionName?.nilIfBlank { lines.append("Album ufficiale: \(album)") }
+            if let song = item.trackName?.nilIfBlank { lines.append("Brano ufficiale: \(song)") }
+            if let isoDate = item.releaseDate?.nilIfBlank {
+                lines.append("Data di uscita ufficiale: \(formatItalianDate(from: isoDate))")
+            }
+            if let genre = item.primaryGenreName?.nilIfBlank { lines.append("Genere: \(genre)") }
+            if let count = item.trackCount { lines.append("Numero tracce: \(count)") }
+            if let copyright = item.copyright?.nilIfBlank { lines.append("Etichetta / Copyright: \(copyright)") }
+
+            let label = item.collectionName?.nilIfBlank ?? item.trackName?.nilIfBlank ?? "Apple Music"
+            return [
+                WebEvidence(
+                    source: VerifiedSource(title: "Catalogo Apple: \(label)", url: itemURL),
+                    snippet: lines.joined(separator: "\n"),
+                    provider: "Apple Catalog"
+                )
+            ]
+        } catch {
+            return []
+        }
+    }
+
+    // MARK: - Prompt con controllo incrociato delle fonti
+
+    private func buildTrackPrompt(track: CurrentTrack, lyrics: String?, web: WebBundle) -> String {
         let albumLine = track.album.isEmpty ? "Non specificato" : track.album
         let lyricsSection: String
         if let lyrics {
-            let clipped = String(lyrics.prefix(6000))
             lyricsSection = """
-            Testo verificato del brano:
+            Testo verificato del brano (da LRCLib):
             \"\"\"
-            \(clipped)
+            \(String(lyrics.prefix(5500)))
             \"\"\"
             """
         } else {
-            lyricsSection = "Testo non trovato su LRCLib: cerca online interviste, recensioni e analisi attendibili senza inventare versi o citazioni inesistenti."
+            lyricsSection = "Testo non trovato su LRCLib: non inventare versi o citazioni."
         }
 
         return """
-        OBBLIGATORIO: Prima di scrivere la risposta DEVI eseguire almeno una ricerca Google con lo strumento google_search per verificare storia, interviste, crediti di produzione, sample e curiosità reali su questo brano. Non rispondere mai solo a memoria.
-
-        Sei un ricercatore musicale rigoroso. Analizza in italiano il seguente brano basandoti su fonti verificate, senza inventare nulla (se un dettaglio non è confermato da fonti affidabili, dillo chiaramente).
+        Sei un ricercatore musicale rigoroso. Analizza in italiano il seguente brano basandoti sulle fonti web fornite qui sotto, incrociandole ed eliminando eventuali pagine omonime non pertinenti.
 
         Titolo: \(track.title)
         Artista: \(track.artist)
@@ -471,36 +801,49 @@ final class AnalysisService: ObservableObject {
 
         \(lyricsSection)
 
-        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun testo prima o dopo le parentesi graffe, nessun Markdown, nessun carattere di a capo non escapato dentro le stringhe) con queste 4 chiavi esatte:
+        FONTI WEB RECUPERATE ADESSO:
+        \(web.promptContext)
+
+        REGOLE FERREE:
+        1. Dai massima priorità ai fatti confermati nelle fonti web sopra e nel testo verificato.
+        2. Ignora eventuali risultati omonimi che non riguardano questo artista/brano.
+        3. ZERO invenzioni: se un dettaglio (produttore, sample, intervista) non è confermato, non inventarlo.
+
+        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun Markdown o asterischi) con queste 4 chiavi esatte:
         {
           "storyAndReason": "Come nasce il brano, perché è stato scritto, ispirazione e storia verificata della creazione.",
           "context": "Il contesto personale, artistico, culturale o storico in cui si inserisce il brano nella carriera dell'artista.",
           "lyricsExplanation": "Spiegazione chiara del significato del testo, dei temi principali, delle immagini e delle metafore chiave.",
-          "curiosities": "Curiosità verificate, retroscena di registrazione, produttori, sample/campionamenti, collaborazioni o dichiarazioni reali in interviste."
+          "curiosities": "Curiosità verificate, retroscena di registrazione, produttori, sample/campionamenti, collaborazioni o aneddoti reali."
         }
         """
     }
 
-    private func buildAlbumPrompt(track: CurrentTrack) -> String {
+    private func buildAlbumPrompt(track: CurrentTrack, web: WebBundle) -> String {
         let albumInstruction: String
         if track.album.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            albumInstruction = "L'album non è indicato nei metadati: cerca online l'album o EP di appartenenza del brano \"\(track.title)\" di \(track.artist) (oppure, se è un singolo autonomo, specificalo chiaramente e racconta il progetto/era discografica in cui è uscito)."
+            albumInstruction = "Album non indicato nei metadati: identifica dalle fonti l'album o EP di appartenenza del brano \"\(track.title)\" di \(track.artist)."
         } else {
-            albumInstruction = "Album: \(track.album) (brano attualmente in ascolto: \(track.title))."
+            albumInstruction = "Album: \(track.album) (brano in ascolto: \(track.title))."
         }
 
         return """
-        OBBLIGATORIO: Prima di scrivere la risposta DEVI eseguire almeno una ricerca Google con lo strumento google_search per verificare la data di uscita esatta, la genesi, i produttori, le interviste e le curiosità reali dell'album. Non rispondere mai solo a memoria.
-
-        Sei un ricercatore musicale rigoroso. Racconta in italiano la storia completa dell'album in modo accurato e basato su fonti confermate, senza inventare nulla.
+        Sei un ricercatore musicale rigoroso. Racconta in italiano la storia completa dell'album basandoti sulle fonti web fornite qui sotto, ignorando eventuali pagine omonime non pertinenti.
 
         Artista: \(track.artist)
         \(albumInstruction)
 
-        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun testo prima o dopo le parentesi graffe, nessun Markdown, nessun carattere di a capo non escapato dentro le stringhe) con queste 6 chiavi esatte:
+        FONTI WEB RECUPERATE ADESSO:
+        \(web.promptContext)
+
+        REGOLE FERREE:
+        1. Usa la data di uscita, i crediti e i fatti confermati dalle fonti web sopra (in particolare Catalogo Apple, Wikipedia e articoli).
+        2. ZERO invenzioni: se un dettaglio non trova conferma, non inventarlo.
+
+        Restituisci ESCLUSIVAMENTE un oggetto JSON valido (nessun Markdown o asterischi) con queste 6 chiavi esatte:
         {
           "albumTitle": "Titolo ufficiale dell'album o EP.",
-          "releaseDate": "Data di uscita verificata in italiano (es. '12 novembre 2021').",
+          "releaseDate": "Data di uscita verificata in italiano (es. '29 ottobre 2021').",
           "originAndStory": "La storia completa di come nasce l'intero album: genesi, periodo di scrittura, registrazione, scelte sonore e produttori.",
           "contextAndGoal": "Il contesto storico e artistico in cui esce il disco e qual era l'obiettivo, il concept o il messaggio generale dell'intero progetto.",
           "titleMeaning": "Il significato del titolo dell'album e, se rilevante, il legame con la copertina o con il filo conduttore del disco.",
@@ -514,6 +857,7 @@ final class AnalysisService: ObservableObject {
         track: CurrentTrack,
         focusCategory: String,
         lyrics: String?,
+        web: WebBundle,
         history: [QAItem]
     ) -> String {
         let albumLine = track.album.isEmpty ? "Non specificato" : track.album
@@ -527,24 +871,27 @@ final class AnalysisService: ObservableObject {
 
         let lyricsHint: String
         if let lyrics {
-            lyricsHint = "\nEstratto del testo verificato del brano (utile se la domanda riguarda versi specifici):\n\"\"\"\n\(String(lyrics.prefix(3500)))\n\"\"\"\n"
+            lyricsHint = "\nEstratto del testo verificato:\n\"\"\"\n\(String(lyrics.prefix(3500)))\n\"\"\"\n"
         } else {
             lyricsHint = ""
         }
 
         return """
-        OBBLIGATORIO: Prima di formulare qualsiasi risposta DEVI eseguire sempre una ricerca web con lo strumento google_search cercando interviste, articoli, crediti e fonti reali sul brano o sull'album. È vietato rispondere solo a memoria senza cercare online.
+        Sei un ricercatore musicale estremamente rigoroso. Rispondi in italiano alla domanda dell'utente incrociando le fonti web reali recuperate adesso qui sotto.
 
         Contesto attuale:
-        - Categoria attiva nell'app: \(focusCategory)
+        - Categoria attiva: \(focusCategory)
         - Brano: \(track.title)
         - Artista: \(track.artist)
         - Album: \(albumLine)
         \(lyricsHint)\(historyBlock)
-        REGOLE OBBLIGATORIE DI VERIFICA:
-        1. Cerca sul web con google_search e incrocia le fonti (interviste ufficiali, testate musicali, crediti discografici, Genius/Wikipedia solo se coerenti con fonti primarie).
-        2. Conferma solo ciò che risulta dalle fonti trovate. Se un dettaglio non trova conferme online, scrivilo chiaramente ("Non risultano conferme ufficiali online su questo punto") senza inventare nulla.
-        3. Rispondi in italiano in modo diretto, chiaro e in testo semplice (niente asterischi Markdown come **grassetto**).
+        FONTI WEB RECUPERATE ADESSO:
+        \(web.promptContext)
+
+        REGOLE OBBLIGATORIE:
+        1. Controlla e incrocia le fonti web qui sopra (scartando eventuali pagine omonime non pertinenti).
+        2. Conferma solo ciò che risulta verificabile. Se le fonti recuperate non confermano un dettaglio specifico, dillo chiaramente ("Nelle fonti trovate non risultano conferme ufficiali su questo punto") invece di inventare.
+        3. Rispondi in testo semplice e diretto, senza asterischi Markdown tipo **grassetto**.
 
         Domanda dell'utente:
         \(question)
@@ -590,7 +937,7 @@ final class AnalysisService: ObservableObject {
     private func queryLRCLibSearch(track: CurrentTrack) async -> String? {
         var components = URLComponents(string: "https://lrclib.net/api/search")
         components?.queryItems = [
-            URLQueryItem(name: "artist_name", value: track.artist),
+            URLQueryItem(name: "artist_name", value: primaryArtist(from: track.artist)),
             URLQueryItem(name: "track_name", value: track.title)
         ]
 
@@ -628,79 +975,45 @@ final class AnalysisService: ObservableObject {
         return nil
     }
 
-    // MARK: - Chiamata Gemini con Google Search obbligatorio
+    // MARK: - Chiamata Gemini (senza tool a quota bloccata)
 
-    private func callGeminiJSONWithWebSearch<T: Decodable>(
-        as type: T.Type,
+    private func callGeminiWithFallback(
         prompt: String,
         apiKey: String,
+        responseMimeType: String?,
         temperature: Double
-    ) async throws -> (T, [VerifiedSource]) {
-        var failures: [String] = []
+    ) async throws -> String {
+        var lastError: Error = ServiceError.invalidResponse("Nessun modello Gemini ha risposto.")
 
-        for model in geminiSearchModels {
+        for model in geminiModels {
             do {
-                let result = try await callGeminiWithSearch(
+                return try await callGemini(
                     model: model,
                     prompt: prompt,
                     apiKey: apiKey,
-                    temperature: temperature
-                )
-                let cleanedJSON = sanitizeJSONControlCharacters(extractJSONObject(from: result.text))
-                guard let data = cleanedJSON.data(using: .utf8) else {
-                    throw ServiceError.retryable("[\(model)] JSON non leggibile.")
-                }
-                let decoded = try JSONDecoder().decode(T.self, from: data)
-                return (decoded, result.sources)
-            } catch let serviceError as ServiceError {
-                if case .fatal(let message) = serviceError {
-                    throw ServiceError.fatal(message)
-                }
-                failures.append(serviceError.localizedDescription)
-            } catch {
-                failures.append("[\(model)] Formato JSON non valido: \(error.localizedDescription)")
-            }
-        }
-
-        let summary = failures.joined(separator: "\n• ")
-        throw ServiceError.invalidResponse("Ricerca web obbligatoria non riuscita:\n• \(summary)")
-    }
-
-    private func callGeminiTextWithWebSearch(
-        prompt: String,
-        apiKey: String,
-        temperature: Double
-    ) async throws -> GeminiResult {
-        var failures: [String] = []
-
-        for model in geminiSearchModels {
-            do {
-                return try await callGeminiWithSearch(
-                    model: model,
-                    prompt: prompt,
-                    apiKey: apiKey,
+                    responseMimeType: responseMimeType,
                     temperature: temperature
                 )
             } catch let serviceError as ServiceError {
                 if case .fatal(let message) = serviceError {
                     throw ServiceError.fatal(message)
                 }
-                failures.append(serviceError.localizedDescription)
+                lastError = serviceError
             } catch {
-                failures.append("[\(model)] \(error.localizedDescription)")
+                lastError = error
             }
         }
 
-        let summary = failures.joined(separator: "\n• ")
-        throw ServiceError.invalidResponse("Ricerca web obbligatoria non riuscita:\n• \(summary)")
+        throw lastError
     }
 
-    private func callGeminiWithSearch(
+    private func callGemini(
         model: String,
         prompt: String,
         apiKey: String,
+        responseMimeType: String?,
         temperature: Double
-    ) async throws -> GeminiResult {
+    ) async throws -> String {
         var components = URLComponents(string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent")
         components?.queryItems = [URLQueryItem(name: "key", value: apiKey)]
 
@@ -710,13 +1023,12 @@ final class AnalysisService: ObservableObject {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
-        request.timeoutInterval = 40
+        request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
         let payload = GeminiRequest(
             contents: [.init(parts: [.init(text: prompt)])],
-            generationConfig: .init(temperature: temperature),
-            tools: [.init(google_search: .init())]
+            generationConfig: .init(temperature: temperature, responseMimeType: responseMimeType)
         )
         request.httpBody = try JSONEncoder().encode(payload)
 
@@ -738,45 +1050,34 @@ final class AnalysisService: ObservableObject {
         }
 
         let decoded = try JSONDecoder().decode(GeminiResponse.self, from: data)
-        guard let candidate = decoded.candidates?.first,
-              let text = candidate.content?.parts?.compactMap(\.text).joined().nilIfBlank else {
+        guard let text = decoded.candidates?.first?.content?.parts?.compactMap(\.text).joined().nilIfBlank else {
             throw ServiceError.retryable("[\(model)] Risposta vuota.")
         }
-
-        var seenURLs = Set<String>()
-        var sources: [VerifiedSource] = []
-        let metadata = candidate.groundingMetadata
-
-        for chunk in metadata?.groundingChunks ?? [] {
-            guard let rawURI = chunk.web?.uri?.nilIfBlank,
-                  let sourceURL = URL(string: rawURI),
-                  let scheme = sourceURL.scheme?.lowercased(),
-                  (scheme == "http" || scheme == "https"),
-                  !seenURLs.contains(sourceURL.absoluteString) else {
-                continue
-            }
-            seenURLs.insert(sourceURL.absoluteString)
-            let label = chunk.web?.title?.nilIfBlank ?? sourceURL.host ?? "Fonte web"
-            sources.append(VerifiedSource(title: label, url: sourceURL))
-        }
-
-        let hasQueries = !(metadata?.webSearchQueries?.isEmpty ?? true)
-        let hasSupports = !(metadata?.groundingSupports?.isEmpty ?? true)
-        let hasEntryPoint = metadata?.searchEntryPoint?.renderedContent?.nilIfBlank != nil
-        let didSearch = !sources.isEmpty || hasQueries || hasSupports || hasEntryPoint
-
-        guard didSearch else {
-            throw ServiceError.retryable("[\(model)] Ha risposto senza eseguire la ricerca Google.")
-        }
-
-        return GeminiResult(
-            text: text,
-            sources: sources,
-            usedWebSearch: true
-        )
+        return text
     }
 
     // MARK: - Utilità
+
+    private func primaryArtist(from artist: String) -> String {
+        let separators = [" & ", ",", " feat.", " ft.", " featuring "]
+        var cleaned = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        for sep in separators {
+            if let range = cleaned.range(of: sep, options: .caseInsensitive) {
+                cleaned = String(cleaned[..<range.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+        }
+        return cleaned.isEmpty ? artist : cleaned
+    }
+
+    private func formatItalianDate(from isoString: String) -> String {
+        let iso = ISO8601DateFormatter()
+        guard let date = iso.date(from: isoString) else { return isoString }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "it_IT")
+        df.dateStyle = .long
+        df.timeStyle = .none
+        return df.string(from: date)
+    }
 
     private func albumCacheKey(for track: CurrentTrack) -> String {
         let artist = track.artist.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)

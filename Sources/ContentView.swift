@@ -30,6 +30,16 @@ struct ContentView: View {
                     if let track = nowPlaying.currentTrack {
                         trackHeader(track)
                         categoryPicker
+
+                        if let notice = analysisService.searchNotice {
+                            Text(notice)
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .multilineTextAlignment(.center)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity)
+                        }
+
                         if selectedCategory == .song {
                             songAnalysisContent(track)
                         } else {
@@ -238,7 +248,7 @@ struct ContentView: View {
     @ViewBuilder
     private func songAnalysisContent(_ track: CurrentTrack) -> some View {
         if analysisService.isLoading {
-            loadingCard(message: "Ricerca web e analisi del brano in corso...")
+            loadingCard(message: "Cerco fonti online e analizzo il brano...")
         } else if let error = analysisService.errorMessage {
             errorCard(message: error) {
                 Task {
@@ -248,11 +258,9 @@ struct ContentView: View {
         } else if let analysis = analysisService.analysis {
             VStack(spacing: 14) {
                 HStack(spacing: 10) {
-                    if analysis.webVerified {
-                        Label("Verificato online", systemImage: "checkmark.shield.fill")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.green)
-                    }
+                    Label(analysis.sourceSummary, systemImage: analysis.sources.isEmpty ? "info.circle.fill" : "checkmark.shield.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(analysis.sources.isEmpty ? .orange : .green)
 
                     if analysis.lyricsFound {
                         Label("Testo OK", systemImage: "checkmark.seal.fill")
@@ -261,7 +269,7 @@ struct ContentView: View {
                     }
 
                     if analysisService.isFromCache {
-                        Label("In cache", systemImage: "bolt.fill")
+                        Label("Cache", systemImage: "bolt.fill")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.blue)
                     }
@@ -286,7 +294,7 @@ struct ContentView: View {
     @ViewBuilder
     private func albumAnalysisContent(_ track: CurrentTrack) -> some View {
         if analysisService.isLoadingAlbum {
-            loadingCard(message: "Ricerca web e analisi dell'album in corso...")
+            loadingCard(message: "Cerco fonti online e analizzo l'album...")
         } else if let error = analysisService.albumErrorMessage {
             errorCard(message: error) {
                 Task {
@@ -296,14 +304,12 @@ struct ContentView: View {
         } else if let album = analysisService.albumAnalysis {
             VStack(spacing: 14) {
                 HStack(spacing: 10) {
-                    if album.webVerified {
-                        Label("Verificato online", systemImage: "checkmark.shield.fill")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.green)
-                    }
+                    Label(album.sourceSummary, systemImage: album.sources.isEmpty ? "info.circle.fill" : "checkmark.shield.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(album.sources.isEmpty ? .orange : .green)
 
                     if analysisService.isAlbumFromCache {
-                        Label("Album in cache", systemImage: "bolt.fill")
+                        Label("Cache", systemImage: "bolt.fill")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.blue)
                     }
@@ -324,7 +330,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Sezione domande specifiche (sempre con ricerca web)
+    // MARK: - Sezione domande specifiche
 
     private func qaSection(_ track: CurrentTrack) -> some View {
         let items = analysisService.qaItems(for: track)
@@ -336,10 +342,14 @@ struct ContentView: View {
                         .font(.headline.bold())
                         .foregroundStyle(.white)
 
-                    Text("Ricerca Google sempre attiva con conferma delle fonti.")
-                        .font(.caption)
-                        .foregroundStyle(.white.opacity(0.6))
-                        .fixedSize(horizontal: false, vertical: true)
+                    Text(
+                        analysisService.hasTavilyKey
+                            ? "Ricerca web completa (Tavily + Wikipedia + Catalogo Apple)."
+                            : "Ricerca attiva su Wikipedia + Catalogo Apple. Aggiungi Tavily (gratis) per cercare interviste e articoli."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.62))
+                    .fixedSize(horizontal: false, vertical: true)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -350,6 +360,18 @@ struct ContentView: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.7))
                 }
+            }
+
+            if !analysisService.hasTavilyKey {
+                Button {
+                    showSettings = true
+                } label: {
+                    Label("Attiva ricerca web completa (Tavily gratis)", systemImage: "globe")
+                        .font(.caption.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.blue)
             }
 
             if !items.isEmpty {
@@ -364,7 +386,7 @@ struct ContentView: View {
                 HStack(spacing: 10) {
                     ProgressView()
                         .tint(.white)
-                    Text("Cerco su Google e verifico le fonti...")
+                    Text("Cerco fonti online e incrocio le informazioni...")
                         .font(.subheadline)
                         .foregroundStyle(.white.opacity(0.8))
                         .fixedSize(horizontal: false, vertical: true)
@@ -580,9 +602,9 @@ private struct QACardView: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-            Label("Verificato online", systemImage: "checkmark.shield.fill")
+            Label(item.sourceSummary, systemImage: item.sources.isEmpty ? "info.circle.fill" : "checkmark.shield.fill")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
+                .foregroundStyle(item.sources.isEmpty ? .orange : .green)
 
             if !item.sources.isEmpty {
                 SourcesListView(sources: item.sources)
@@ -674,6 +696,22 @@ private struct SettingsSheet: View {
                     Text("Google AI Studio API Key")
                 } footer: {
                     Text("La chiave viene salvata solo in locale sul tuo iPhone.")
+                }
+
+                Section {
+                    TextField("Incolla la Tavily API Key (tvly-...)", text: $analysisService.tavilyApiKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+
+                    if let url = URL(string: "[https://app.tavily.com](https://app.tavily.com)") {
+                        Link(destination: url) {
+                            Label("Ottieni chiave gratuita su app.tavily.com", systemImage: "safari")
+                        }
+                    }
+                } header: {
+                    Text("Ricerca Web Completa (Tavily)")
+                } footer: {
+                    Text("Gratuita (1.000 ricerche/mese senza carta). Sblocca la ricerca su interviste, Rockit, Genius e testate musicali; senza chiave MusicLore usa comunque Wikipedia e Catalogo Apple.")
                 }
 
                 Section("Cache locale") {

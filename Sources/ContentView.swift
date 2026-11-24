@@ -2,12 +2,24 @@ import MediaPlayer
 import SwiftUI
 import UIKit
 
+private enum AnalysisCategory: String, CaseIterable, Identifiable {
+    case song = "Canzone"
+    case album = "Album"
+
+    var id: String { rawValue }
+}
+
 struct ContentView: View {
     @StateObject private var nowPlaying = NowPlayingManager()
     @StateObject private var analysisService = AnalysisService()
 
+    @State private var selectedCategory: AnalysisCategory = .song
     @State private var showSettings = false
     @State private var showManualSearch = false
+
+    private var activeTaskID: String {
+        "\(nowPlaying.currentTrack?.id ?? "none")|\(selectedCategory.rawValue)"
+    }
 
     var body: some View {
         NavigationStack {
@@ -15,7 +27,12 @@ struct ContentView: View {
                 VStack(spacing: 18) {
                     if let track = nowPlaying.currentTrack {
                         trackHeader(track)
-                        analysisContent(track)
+                        categoryPicker
+                        if selectedCategory == .song {
+                            songAnalysisContent(track)
+                        } else {
+                            albumAnalysisContent(track)
+                        }
                     } else {
                         emptyStateView
                     }
@@ -50,7 +67,12 @@ struct ContentView: View {
                         nowPlaying.refreshFromAppleMusic(clearManual: true)
                         if let track = nowPlaying.currentTrack {
                             Task {
-                                await analysisService.analyze(track: track, forceRefresh: true)
+                                switch selectedCategory {
+                                case .song:
+                                    await analysisService.analyze(track: track, forceRefresh: true)
+                                case .album:
+                                    await analysisService.analyzeAlbum(track: track, forceRefresh: true)
+                                }
                             }
                         }
                     } label: {
@@ -68,11 +90,17 @@ struct ContentView: View {
                 }
             }
             .sheet(isPresented: $showSettings, onDismiss: {
-                if analysisService.hasAPIKey,
-                   analysisService.analysis == nil,
-                   let track = nowPlaying.currentTrack {
-                    Task {
-                        await analysisService.analyze(track: track)
+                guard analysisService.hasAPIKey, let track = nowPlaying.currentTrack else { return }
+                Task {
+                    switch selectedCategory {
+                    case .song:
+                        if analysisService.analysis == nil {
+                            await analysisService.analyze(track: track)
+                        }
+                    case .album:
+                        if analysisService.albumAnalysis == nil {
+                            await analysisService.analyzeAlbum(track: track)
+                        }
                     }
                 }
             }) {
@@ -86,12 +114,29 @@ struct ContentView: View {
             .onAppear {
                 nowPlaying.requestPermissionAndRefresh()
             }
-            .task(id: nowPlaying.currentTrack?.id) {
+            .task(id: activeTaskID) {
                 guard let track = nowPlaying.currentTrack else { return }
-                await analysisService.analyze(track: track)
+                switch selectedCategory {
+                case .song:
+                    await analysisService.analyze(track: track)
+                case .album:
+                    await analysisService.analyzeAlbum(track: track)
+                }
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Selettore Canzone / Album
+
+    private var categoryPicker: some View {
+        Picker("Categoria", selection: $selectedCategory) {
+            ForEach(AnalysisCategory.allCases) { category in
+                Text(category.rawValue).tag(category)
+            }
+        }
+        .pickerStyle(.segmented)
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Sfondo vincolato allo schermo
@@ -183,47 +228,18 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
     }
 
-    // MARK: - Contenuto analisi
+    // MARK: - Contenuto analisi Canzone
 
     @ViewBuilder
-    private func analysisContent(_ track: CurrentTrack) -> some View {
+    private func songAnalysisContent(_ track: CurrentTrack) -> some View {
         if analysisService.isLoading {
-            VStack(spacing: 12) {
-                ProgressView()
-                    .controlSize(.large)
-                    .tint(.white)
-                Text("Analisi del brano in corso...")
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.75))
-            }
-            .frame(maxWidth: .infinity)
-            .padding(24)
-            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            loadingCard(message: "Analisi del brano in corso...")
         } else if let error = analysisService.errorMessage {
-            VStack(spacing: 12) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.title2)
-                    .foregroundStyle(.orange)
-
-                Text(error)
-                    .font(.subheadline)
-                    .foregroundStyle(.white.opacity(0.85))
-                    .multilineTextAlignment(.center)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity)
-
-                Button("Riprova") {
-                    Task {
-                        await analysisService.analyze(track: track, forceRefresh: true)
-                    }
+            errorCard(message: error) {
+                Task {
+                    await analysisService.analyze(track: track, forceRefresh: true)
                 }
-                .buttonStyle(.borderedProminent)
-                .tint(.white.opacity(0.15))
-                .foregroundStyle(.blue)
             }
-            .frame(maxWidth: .infinity)
-            .padding(18)
-            .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         } else if let analysis = analysisService.analysis {
             VStack(spacing: 14) {
                 HStack(spacing: 10) {
@@ -251,6 +267,76 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity)
         }
+    }
+
+    // MARK: - Contenuto analisi Album
+
+    @ViewBuilder
+    private func albumAnalysisContent(_ track: CurrentTrack) -> some View {
+        if analysisService.isLoadingAlbum {
+            loadingCard(message: "Analisi dell'album in corso...")
+        } else if let error = analysisService.albumErrorMessage {
+            errorCard(message: error) {
+                Task {
+                    await analysisService.analyzeAlbum(track: track, forceRefresh: true)
+                }
+            }
+        } else if let album = analysisService.albumAnalysis {
+            VStack(spacing: 14) {
+                if analysisService.isAlbumFromCache {
+                    Label("Album in cache", systemImage: "bolt.fill")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.blue)
+                        .frame(maxWidth: .infinity)
+                }
+
+                AlbumInfoBanner(title: album.albumTitle, releaseDate: album.releaseDate)
+                AnalysisCard(title: "Come nasce l'album", text: album.originAndStory)
+                AnalysisCard(title: "Contesto e obiettivo", text: album.contextAndGoal)
+                AnalysisCard(title: "Significato del titolo", text: album.titleMeaning)
+                AnalysisCard(title: "Curiosità e retroscena", text: album.curiosities)
+            }
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    // MARK: - Componenti comuni stato caricamento / errore
+
+    private func loadingCard(message: String) -> some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.large)
+                .tint(.white)
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.75))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func errorCard(message: String, onRetry: @escaping () -> Void) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.title2)
+                .foregroundStyle(.orange)
+
+            Text(message)
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.85))
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity)
+
+            Button("Riprova", action: onRetry)
+                .buttonStyle(.borderedProminent)
+                .tint(.white.opacity(0.15))
+                .foregroundStyle(.blue)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(18)
+        .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 
     // MARK: - Stato vuoto
@@ -296,6 +382,40 @@ struct ContentView: View {
         .frame(maxWidth: .infinity)
         .padding(24)
         .padding(.top, 40)
+    }
+}
+
+// MARK: - Banner scheda album
+
+private struct AlbumInfoBanner: View {
+    let title: String
+    let releaseDate: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "opticaldisc.fill")
+                .font(.title2)
+                .foregroundStyle(.white.opacity(0.85))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(.headline.bold())
+                    .foregroundStyle(.white)
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                Label("Uscita: \(releaseDate)", systemImage: "calendar")
+                    .font(.subheadline)
+                    .foregroundStyle(.white.opacity(0.75))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
     }
 }
 
@@ -351,7 +471,7 @@ private struct SettingsSheet: View {
                         analysisService.clearCache()
                         cacheCleared = true
                     } label: {
-                        Text("Svuota cache dei brani analizzati")
+                        Text("Svuota cache di brani e album analizzati")
                     }
 
                     if cacheCleared {

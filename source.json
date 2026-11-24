@@ -1,0 +1,34 @@
+{
+  "name": "MusicLore Source",
+  "identifier": "com.personale.musiclore.source",
+  "subtitle": "Aggiornamenti automatici per MusicLore",
+  "apps": [
+    {
+      "name": "MusicLore",
+      "bundleIdentifier": "com.personale.musiclore",
+      "developerName": "Lambroando",
+      "subtitle": "Storia e spiegazione dei brani su Apple Music",
+      "localizedDescription": "App nativa sincronizzata con Apple Music per mostrare storia, contesto e spiegazione del testo dei brani.",
+      "iconURL": "https://raw.githubusercontent.com/Lambroando/MusicLore/main/Sources/Assets.xcassets/AppIcon.appiconset/AppIcon.png",
+      "tintColor": "#1DB954",
+      "versions": [
+        {
+          "version": "1.0.14",
+          "buildVersion": "14",
+          "date": "2026-11-24T01:27:57Z",
+          "localizedDescription": "Aggiungi ricerca web diretta (Tavily + Wikipedia + Catalogo Apple)",
+          "downloadURL": "https://github.com/Lambroando/MusicLore/releases/download/v1.0.14/MusicLore.ipa",
+          "size": 1896101,
+          "minOSVersion": "17.0"
+        }
+      ],
+      "appPermissions": {
+        "entitlements": [],
+        "privacy": {
+          "NSAppleMusicUsageDescription": "Consente di leggere il brano in riproduzione su Apple Music per mostrarne storia, contesto e spiegazione del testo."
+        }
+      }
+    }
+  ],
+  "news": []
+}
